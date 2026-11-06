@@ -131,11 +131,26 @@ export function interrupt(task: Task, at: string, reason: string): Task {
   });
 }
 
+/** 남은 단계 끝에 붙일, 아직 쓰이지 않은 재리뷰 단계 id */
+function freshReviewStep(task: Task): Step {
+  const used = new Set([...task.completedSteps, ...task.remainingSteps].map((s) => s.id));
+  let n = task.reviews.length + 1;
+  while (used.has(`review-${n}`)) n += 1;
+  return { id: `review-${n}`, phase: 'review' };
+}
+
 /**
- * revision 도입 이전(v0.1 초기)에 저장된 상태를 올린다. 종료되지 않은 작업은 기존 검증·리뷰 기록을
- * 이전 세대로 취급해 재검증을 강제하고, 종료된 작업은 기록과 같은 세대로 둔다.
+ * revision 도입 이전(구버전)에 저장된 작업을 현재 규칙으로 올린다. 구버전 기록은 어떤 경로로 만들어졌는지
+ * 알 수 없으므로(검증을 우회한 완료 포함) 현재 revision의 근거로 인정하지 않는다. 기록은 revision 0으로 보존하고
+ * 작업은 revision 1로 올려 재검증과 재리뷰를 강제한다.
+ *  - FAILED: 그대로 둔다.
+ *  - COMPLETED: 신뢰하지 않는다. 구현 결과(implement 완료 단계와 구현자)가 남아 있으면
+ *    재리뷰 단계를 붙여 PAUSED(LEGACY_REVALIDATION)로 되돌리고 수동 resume을 기다린다.
+ *    구현 결과가 없으면 복구할 수 없으므로 사유와 함께 FAILED로 둔다.
+ *  - 그 외(미종료): 상태는 유지하되, 리뷰 단계가 사라진 경우(최종 완료 검증 대기 등) 재리뷰 단계를 붙인다.
+ * 이 함수는 상태 머신 전환이 아니라 저장 형식 마이그레이션이며, 이미 올린 작업은 다시 바꾸지 않는다(멱등).
  */
-export function migrateLegacy(state: HarnessState): HarnessState {
+export function migrateLegacy(state: HarnessState, at: string): HarnessState {
   const tasks: Record<string, Task> = {};
   let changed = false;
   for (const [id, task] of Object.entries(state.tasks)) {
@@ -144,12 +159,45 @@ export function migrateLegacy(state: HarnessState): HarnessState {
       continue;
     }
     changed = true;
-    tasks[id] = {
+    const kept = {
       ...task,
-      revision: isTerminal(task.status) ? 0 : 1,
       verifications: task.verifications.map((v) => ({ ...v, revision: 0 })),
       reviews: task.reviews.map((r) => ({ ...r, revision: 0 })),
     };
+    if (task.status === 'FAILED') {
+      tasks[id] = { ...kept, revision: 0 };
+      continue;
+    }
+    const upgraded: Task = { ...kept, revision: 1 };
+    const needsReview = !upgraded.remainingSteps.some((s) => s.phase === 'review');
+    const withReview: Task = needsReview
+      ? { ...upgraded, remainingSteps: [...upgraded.remainingSteps, freshReviewStep(upgraded)] }
+      : upgraded;
+    if (task.status !== 'COMPLETED') {
+      tasks[id] = withReview;
+    } else if (
+      task.implementers.length > 0 &&
+      task.completedSteps.some((s) => s.phase === 'implement')
+    ) {
+      tasks[id] = {
+        ...withReview,
+        status: 'PAUSED',
+        pauseCause: 'LEGACY_REVALIDATION',
+        pauseReason:
+          'Completed by a pre-revision version whose verification/review cannot be trusted. Manual resume re-verifies and re-reviews the existing implementation.',
+        failureReason: null,
+        updatedAt: at,
+      };
+    } else {
+      tasks[id] = {
+        ...kept,
+        revision: 1,
+        status: 'FAILED',
+        failureReason:
+          'Legacy COMPLETED task cannot be revalidated: no completed implement step or implementer is recorded.',
+        updatedAt: at,
+      };
+    }
   }
   return changed ? { ...state, tasks } : state;
 }

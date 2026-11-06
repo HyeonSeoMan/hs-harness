@@ -32,6 +32,16 @@ function completable(): Task {
   return transition(t, 'VERIFYING', 'T5');
 }
 
+/** revision 도입 전(구버전) 저장 형식으로 되돌린 복사본 */
+function legacyOf(task: Task): Task {
+  const legacy = JSON.parse(JSON.stringify(task)) as Record<string, unknown>;
+  delete legacy['revision'];
+  for (const r of [...(legacy['verifications'] as object[]), ...(legacy['reviews'] as object[])]) {
+    delete (r as Record<string, unknown>)['revision'];
+  }
+  return legacy as unknown as Task;
+}
+
 function stateWith(task: Task): HarnessState {
   return { version: 1, tasks: { [task.id]: task }, agents: { claude: 'AVAILABLE', codex: 'AVAILABLE' } };
 }
@@ -497,16 +507,167 @@ describe('G + 구현 세대. 최신 revision의 검증·독립 리뷰 없이는 
     expect(t.failureReason).toContain('not independent');
   });
 
-  it('revision 도입 전 형식의 미종료 작업은 기존 검증·리뷰가 이전 세대로 취급되어 완료되지 못한다', async () => {
+  it('revision 도입 전 형식의 최종 검증 대기 작업은 기존 기록을 이전 세대로 보존하되 재검증·재리뷰 후 완료한다', async () => {
     const env = await makeEnv();
-    const legacy = JSON.parse(JSON.stringify(completable())) as Record<string, unknown>;
-    delete legacy['revision'];
-    for (const r of [...(legacy['verifications'] as object[]), ...(legacy['reviews'] as object[])]) {
-      delete (r as Record<string, unknown>)['revision'];
-    }
-    await env.store.save(stateWith(legacy as unknown as Task));
+    await env.store.save(stateWith(legacyOf(completable())));
     const restarted = await makeEnv({}, env.dir);
-    expect(restarted.orch.getTask('t1').revision).toBe(1);
-    expect((await restarted.orch.run('t1')).status).toBe('FAILED');
+    const before = restarted.orch.getTask('t1');
+    expect(before.revision).toBe(1);
+    expect(before.verifications.map((v) => v.revision)).toEqual([0]);
+    expect(before.remainingSteps.map((x) => x.id)).toEqual(['review-2']); // 재리뷰 단계가 복원됨
+
+    const t = await restarted.orch.run('t1');
+    expect(t.status).toBe('COMPLETED');
+    expect(restarted.verifier.calls).toBe(1);
+    expect(restarted.codex.calls).toHaveLength(1);
+    expect(restarted.claude.calls).toHaveLength(0);
+  });
+});
+
+describe('구버전 저장 상태 복구 (P1/P2 재검증 결함)', () => {
+  /** 정상 경로로 만들어진 구버전 COMPLETED 최종 체크포인트 */
+  const legacyCompleted = (): Task => legacyOf({ ...completable(), status: 'COMPLETED' });
+  /** 검증을 우회해 잘못 완료된 구버전 스냅샷: 검증 기록이 없고 리뷰만 있다 */
+  const legacyBypassed = (): Task => legacyOf({ ...completable(), status: 'COMPLETED', verifications: [] });
+
+  it('1. 검증을 우회해 완료된 구버전 스냅샷은 복원해도 COMPLETED로 인정되지 않는다 (기록은 보존)', async () => {
+    const env = await makeEnv();
+    await env.store.save(stateWith(legacyBypassed()));
+    const restarted = await makeEnv({}, env.dir);
+    const t = restarted.orch.getTask('t1');
+
+    expect(t.status).toBe('PAUSED');
+    expect(t.pauseCause).toBe('LEGACY_REVALIDATION');
+    expect(t.reviews).toHaveLength(1); // 과거 기록 보존
+    expect(t.completedSteps.map((s) => s.id)).toEqual(['a', 'review']);
+    expect(t.implementers).toEqual(['claude']);
+    expect(verifyCompletion({ ...t, status: 'VERIFYING' }).length).toBeGreaterThan(0);
+    // 자동으로 아무것도 실행하지 않는다
+    expect((await restarted.orch.run('t1')).status).toBe('PAUSED');
+    expect(restarted.verifier.calls + restarted.claude.calls.length + restarted.codex.calls.length).toBe(0);
+  });
+
+  it('1-b. 구현 결과를 확인할 수 없는 구버전 COMPLETED는 자동 완료하지 않고 복구 불가 사유와 함께 FAILED', async () => {
+    const env = await makeEnv();
+    const noImpl = { ...legacyBypassed(), implementers: [] };
+    await env.store.save(stateWith(noImpl));
+    const t = (await makeEnv({}, env.dir)).orch.getTask('t1');
+    expect(t.status).toBe('FAILED');
+    expect(t.failureReason).toContain('cannot be revalidated');
+    expect(t.reviews).toHaveLength(1);
+  });
+
+  it('2. 정상 구버전 최종 체크포인트는 재검증·재리뷰 후 완료할 수 있다 (구현 재실행 없음)', async () => {
+    const env = await makeEnv();
+    await env.store.save(stateWith(legacyCompleted()));
+    const restarted = await makeEnv({}, env.dir);
+    expect(restarted.orch.getTask('t1').status).toBe('PAUSED');
+
+    const done = await restarted.orch.resume('t1');
+    expect(done.status).toBe('COMPLETED');
+    expect(restarted.claude.calls).toHaveLength(0);
+    expect(restarted.verifier.calls).toBe(1);
+    expect(restarted.codex.calls).toHaveLength(1);
+    expect(done.verifications.map((v) => [v.revision, v.ok])).toEqual([[0, true], [1, true]]);
+    expect(done.reviews.map((r) => r.revision)).toEqual([0, 1]);
+    expect(done.reviews.at(-1)).toMatchObject({ reviewer: 'codex', independent: true, verdict: 'approved' });
+    expect(done.completedSteps.at(-1)?.id).toBe('review-2');
+  });
+
+  it('2-b. 재검증이 실패하거나 재리뷰가 지적하면 수정 루프로 가며, 복구 가능한 작업이 곧바로 FAILED가 되지 않는다', async () => {
+    const env = await makeEnv();
+    await env.store.save(stateWith(legacyCompleted()));
+    const r = await makeEnv({ verifier: [{ ok: false, summary: 'regressed' }] }, env.dir);
+    const done = await r.orch.resume('t1');
+    expect(done.status).toBe('COMPLETED');
+    expect(r.claude.calls[0]).toMatchObject({ feedback: 'regressed', remainingSteps: ['fix-1'] });
+  });
+
+  it('3. 에이전트가 반환한 오류 객체를 나중에 바꿔도 내부 상태와 저장소는 바뀌지 않는다', async () => {
+    const original = { type: 'AUTH' as const, message: 'login required' };
+    const claude: Agent = {
+      id: 'claude',
+      async run(): Promise<AgentResponse> {
+        return { ok: false, error: original, completedSteps: [] };
+      },
+    };
+    const { store } = await makeEnv();
+    const orch = await Orchestrator.open({ store, agents: { claude, codex: new MockAgent('codex') }, verifier: new MockVerifier() });
+    await orch.createTask({ id: 't1', description: 'x' });
+    const paused = await orch.run('t1');
+    expect(paused.lastError).toEqual({ type: 'AUTH', message: 'login required' });
+
+    original.message = 'hacked';
+    (original as { type: string }).type = 'EXECUTION';
+    expect(orch.getTask('t1').lastError).toEqual({ type: 'AUTH', message: 'login required' });
+    expect((await store.load()).tasks['t1']?.lastError).toEqual({ type: 'AUTH', message: 'login required' });
+  });
+
+  it('3-b. 리뷰 응답 객체와 오류 응답에 붙은 추가 속성도 내부 상태로 들어오지 않는다', async () => {
+    const review = { verdict: 'approved' as const, feedback: 'ok', extra: { nested: ['x'] } };
+    const codex: Agent = {
+      id: 'codex',
+      async run(req): Promise<AgentResponse> {
+        return { ok: true, completedSteps: req.remainingSteps, output: 'done', review };
+      },
+    };
+    const { store } = await makeEnv();
+    const orch = await Orchestrator.open({ store, agents: { claude: new MockAgent('claude'), codex }, verifier: new MockVerifier() });
+    await orch.createTask({ id: 't1', description: 'x' });
+    const done = await orch.run('t1');
+    review.feedback = 'hacked';
+    review.extra.nested.push('y');
+    expect(orch.getTask('t1')).toEqual(done);
+    expect(JSON.stringify(done)).not.toContain('nested');
+  });
+
+  it('4. 이전 revision의 검증·리뷰 기록은 현재 revision의 승인 근거로 재사용되지 않는다', async () => {
+    const env = await makeEnv();
+    // revision 1에서 검증·승인된 뒤 revision 2로 구현이 바뀌어 PAUSED가 된 상태
+    const base = completable();
+    const stale: Task = {
+      ...base,
+      status: 'PAUSED',
+      revision: 2,
+      pauseCause: 'INTERRUPTED',
+      pauseReason: 'test',
+      completedSteps: base.completedSteps.filter((s) => s.phase === 'implement'),
+      remainingSteps: [{ id: 'review-2', phase: 'review' }],
+    };
+    await env.store.save(stateWith(stale));
+    const r = await makeEnv({}, env.dir);
+    const done = await r.orch.resume('t1');
+
+    expect(done.status).toBe('COMPLETED');
+    expect(r.verifier.calls).toBe(1); // 이전 검증 재사용 없이 다시 검증
+    expect(r.codex.calls).toHaveLength(1); // 이전 승인 재사용 없이 다시 리뷰
+    expect(done.verifications.at(-1)?.revision).toBe(2);
+    expect(done.reviews.at(-1)?.revision).toBe(2);
+  });
+
+  it('5. 복구 도중 재시작해도 같은 안전 규칙이 유지되고 마이그레이션은 중복 적용되지 않는다', async () => {
+    const first = await makeEnv();
+    await first.store.save(stateWith(legacyCompleted()));
+
+    const afterMigration = await makeEnv({}, first.dir);
+    const snapshot = afterMigration.orch.getTask('t1');
+    const again = await makeEnv({}, first.dir); // 재시작: 이미 올린 작업을 다시 바꾸지 않음
+    expect(again.orch.getTask('t1')).toEqual(snapshot);
+    expect(snapshot.revision).toBe(1);
+
+    // 재리뷰 중 Codex 인증 실패로 멈춘 뒤 재시작
+    const interrupted = await makeEnv({ codex: [{ type: 'fail', error: 'AUTH' }] }, first.dir);
+    const paused = await interrupted.orch.resume('t1');
+    expect(paused).toMatchObject({ status: 'PAUSED', pauseCause: 'AGENT_UNAVAILABLE' });
+    expect(interrupted.verifier.calls).toBe(1);
+
+    const last = await makeEnv({}, first.dir);
+    expect(last.orch.getTask('t1').status).toBe('PAUSED');
+    const done = await last.orch.resume('t1', { makeAvailable: ['codex'] });
+    expect(done.status).toBe('COMPLETED');
+    expect(last.verifier.calls).toBe(0); // 현재 revision의 검증은 이미 통과해 있으므로 재사용 가능
+    expect(done.reviews.map((r) => r.revision)).toEqual([0, 1]);
+    expect(done.reviews).toHaveLength(2);
+    expect(last.claude.calls).toHaveLength(0);
   });
 });

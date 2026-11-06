@@ -106,7 +106,7 @@ export class Orchestrator {
     resolveLimit('maxFixRounds', opts.maxFixRounds, 3, 0);
     const now = opts.now ?? (() => new Date().toISOString());
     const loaded = structuredClone(await opts.store.load());
-    const migrated = migrateLegacy(loaded);
+    const migrated = migrateLegacy(loaded, now());
     const { state, recovered } = recoverInterrupted(migrated, now());
     if (state !== loaded) await opts.store.save(structuredClone(state));
     return new Orchestrator(opts, state, recovered);
@@ -285,9 +285,10 @@ export class Orchestrator {
 
   private async settleResult(running: Task, agentId: AgentId, phase: Phase, response: AgentResponse): Promise<void> {
     const at = this.now();
-    const review = response.ok ? response.review : undefined;
+    const review = response.ok && response.review ? { verdict: response.review.verdict, feedback: response.review.feedback } : undefined;
     let next = running;
-    let error: AgentError | null = response.ok ? null : response.error;
+    // 응답 객체의 참조를 내부 상태로 가져오지 않도록 필요한 필드만 복사한다.
+    let error: AgentError | null = response.ok ? null : { type: response.error.type, message: response.error.message };
     let reported: string[] = [];
 
     // implement는 부분 진행도 체크포인트로 보존한다. review는 판정(verdict)과 함께 성공한 경우에만 반영한다.
@@ -299,7 +300,7 @@ export class Orchestrator {
         const cap = Math.max(0, phaseRemaining(running, phase).length - 1);
         if (reported.length > cap) {
           reported = reported.slice(0, cap);
-          error = { ...response.error, message: `${response.error.message} (steps reported with an error were not accepted beyond ${cap})` };
+          error = { type: response.error.type, message: `${response.error.message} (steps reported with an error were not accepted beyond ${cap})` };
         }
       }
       try {

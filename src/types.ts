@@ -99,7 +99,7 @@ export interface ReviewRecord {
   at: string;
 }
 
-export type PauseCause = 'AGENT_UNAVAILABLE' | 'INTERRUPTED' | 'VERIFIER_ERROR';
+export type PauseCause = 'AGENT_UNAVAILABLE' | 'INTERRUPTED' | 'VERIFIER_ERROR' | 'LEGACY_REVALIDATION';
 
 export interface Task {
   id: string;
