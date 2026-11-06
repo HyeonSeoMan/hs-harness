@@ -30,6 +30,8 @@ export type ProcessStatus = 'exited' | 'spawn_failed' | 'timeout' | 'aborted' | 
  *  - failed: SIGKILL 후에도 프로세스 그룹에 프로세스가 남아 있다
  *  - unverifiable: 이 OS(Windows)에서는 프로세스 그룹을 확인할 수 없다 (직접 자식만 종료 시도)
  * 한계: setsid/setpgid로 다른 프로세스 그룹이나 세션을 만든 하위 프로세스는 그룹 종료와 확인 대상이 아니다.
+ * Windows에는 이 방식의 프로세스 그룹 확인이 없다: 종료 요청 시에는 unverifiable이며, 종료 요청이 없는 정상 종료 뒤의
+ * 잔존 프로세스는 검사하지 않는다.
  */
 export type GroupCleanup = 'not_needed' | 'confirmed' | 'failed' | 'unverifiable';
 
@@ -43,6 +45,11 @@ export interface ProcessResult {
   truncated: boolean;
   /** 하위 프로세스 정리 결과. confirmed가 아닌 종료는 정리 성공으로 간주하면 안 된다. */
   cleanup: GroupCleanup;
+  /**
+   * 종료를 요청하지 않았는데 부모가 종료한 뒤에도 같은 프로세스 그룹에 살아 있는 프로세스가 있었는지
+   * (정상 종료·외부 시그널 종료 포함). true면 종료 코드가 0이어도 작업 결과를 신뢰하면 안 된다.
+   */
+  orphans: boolean;
   durationMs: number;
   /** spawn_failed일 때 원인 (ENOENT, EACCES, CWD_INVALID 등) */
   error?: { code: string | undefined; message: string };
@@ -65,6 +72,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     stderr: '',
     truncated: false,
     cleanup: 'not_needed',
+    orphans: false,
     durationMs: Date.now() - started,
     ...(error && { error }),
   });
@@ -92,6 +100,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     let terminating = false;
     let cleanupDone = true; // 종료를 요청하면 그룹 정리가 끝날 때까지 false
     let cleanup: GroupCleanup = 'not_needed';
+    let orphans = false;
     let closed: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     const timers: NodeJS.Timeout[] = [];
 
@@ -131,6 +140,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
         stderr: Buffer.concat(err).toString('utf8'),
         truncated,
         cleanup,
+        orphans,
         durationMs: Date.now() - started,
         ...(error && { error }),
       });
@@ -198,6 +208,23 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
       else finish(cause ?? 'exited', null, null); // 정리를 확인하지 못했다: 파이프를 붙든 프로세스를 기다리지 않고 그대로 보고한다
     }
 
+    /**
+     * 종료 요청 없이 부모가 끝난 경우(정상 종료, 외부 SIGKILL 등)에도 같은 그룹에 남은 프로세스를 확인한다.
+     * 짧은 유예 안에 스스로 끝나면 정상으로 보고, 아니면 잔존으로 기록하고 같은 종료 절차를 수행한다.
+     * 그룹 정리가 끝나기 전에는 결과를 확정하지 않는다.
+     */
+    async function inspectOrphans(): Promise<void> {
+      terminating = true; // 이후 타임아웃·취소가 종료 절차를 중복 시작하지 않게 한다
+      cleanupDone = false;
+      if (await waitGroupGone(ORPHAN_SETTLE_MS)) {
+        cleanupDone = true;
+        tryFinish();
+        return;
+      }
+      orphans = true;
+      await terminateGroup();
+    }
+
     /** 원인을 기록하고 종료를 시작한다. */
     function stop(reason: ProcessStatus): void {
       cause ??= reason;
@@ -226,6 +253,10 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
       // pid가 없으면 프로세스가 시작되지 못한 것이다 (ENOENT, EACCES 등)
       if (child.pid === undefined) finish('spawn_failed', null, null, { code: e.code, message: e.message });
     });
+    child.on('exit', () => {
+      // Windows에는 프로세스 그룹이 없어 확인할 수 없다 (GroupCleanup 문서 참고)
+      if (!terminating && process.platform !== 'win32') void inspectOrphans();
+    });
     child.on('close', (code, signal) => {
       closed = { code, signal };
       tryFinish();
@@ -239,6 +270,8 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
   });
 }
 
+/** 부모 종료 후 남은 프로세스가 스스로 끝나기를 기다리는 시간 (정상적으로 정리 중인 자식을 잔존으로 오판하지 않기 위함) */
+const ORPHAN_SETTLE_MS = 100;
 /** SIGKILL 이후 프로세스 그룹이 비는 것을 기다리는 최대 시간 */
 const KILL_CONFIRM_MS = 1000;
 /** 그룹 정리가 끝난 뒤 close 이벤트를 기다리는 최대 시간 */

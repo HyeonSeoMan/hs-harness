@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -133,6 +133,7 @@ describe('프로세스 실행기', () => {
     const leaked: number[] = [];
     afterEach(() => {
       for (const pid of leaked.splice(0)) {
+        if (!Number.isInteger(pid) || pid <= 1) continue; // kill(0)은 호출자의 프로세스 그룹 전체를 죽인다
         try {
           process.kill(pid, 'SIGKILL');
         } catch {
@@ -212,6 +213,75 @@ describe('프로세스 실행기', () => {
         const r = await pending;
         expect(r.status).toBe('aborted');
       }
+    });
+  });
+
+  describe('1-b. 종료 요청이 없어도 부모 종료 후 같은 그룹의 잔존 프로세스를 정리한다', () => {
+    const leaked: number[] = [];
+    afterEach(() => {
+      for (const pid of leaked.splice(0)) {
+        if (!Number.isInteger(pid) || pid <= 1) continue; // kill(0)은 호출자의 프로세스 그룹 전체를 죽인다
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // 이미 종료됨
+        }
+      }
+      vi.restoreAllMocks();
+    });
+
+    /** 같은 그룹에 남아 SIGTERM을 무시하고 700ms 뒤 마커 파일을 쓰려는 자식을 만든다. pid는 파일에 동기 기록한다. */
+    const withChild = (marker: string, pidFile: string, parentEnd: string) => {
+      const childCode = `process.on('SIGTERM',()=>{}); setTimeout(()=>require('fs').writeFileSync(${JSON.stringify(marker)},'late'),700); setInterval(()=>{},1000)`;
+      return `
+        const c = require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}], { stdio: 'ignore' });
+        require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));
+        ${parentEnd}`;
+    };
+
+    const paths = async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'hs-orphan-'));
+      return { marker: join(dir, 'late.txt'), pidFile: join(dir, 'pid') };
+    };
+    const readPid = (pidFile: string) => {
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      leaked.push(pid);
+      return pid;
+    };
+
+    it('부모가 정상 종료(exit 0)해도 남은 자식을 종료하고 확인한 뒤 반환한다', async () => {
+      const { marker, pidFile } = await paths();
+      const r = await node(withChild(marker, pidFile, 'process.exit(0)'), { killGraceMs: 150 });
+      const pid = readPid(pidFile);
+      expect(r).toMatchObject({ status: 'exited', exitCode: 0, orphans: true, cleanup: 'confirmed' });
+      expect(alive(pid)).toBe(false); // 반환 시점에 이미 없다
+      await new Promise((res) => setTimeout(res, 1000));
+      expect(existsSync(marker)).toBe(false); // 반환 뒤 작업 디렉터리에 아무것도 쓰지 않는다
+    });
+
+    it('부모가 외부 SIGKILL로 죽어도 남은 자식을 종료하고 확인한 뒤 반환한다', async () => {
+      const { marker, pidFile } = await paths();
+      const r = await node(withChild(marker, pidFile, `process.kill(process.pid, 'SIGKILL')`), { killGraceMs: 150 });
+      const pid = readPid(pidFile);
+      expect(r).toMatchObject({ status: 'exited', signal: 'SIGKILL', orphans: true, cleanup: 'confirmed' });
+      expect(alive(pid)).toBe(false);
+      await new Promise((res) => setTimeout(res, 1000));
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it('자식이 짧은 유예 안에 스스로 끝나면 잔존으로 보지 않는다', async () => {
+      const r = await node(
+        `require('child_process').spawn(process.execPath, ['-e', 'setTimeout(()=>{},20)'], { stdio: 'ignore' }); process.exit(0)`,
+      );
+      expect(r).toMatchObject({ status: 'exited', exitCode: 0, orphans: false, cleanup: 'not_needed' });
+    });
+
+    it('잔존 프로세스를 종료했다고 확인할 수 없으면 failed로 보고한다', async () => {
+      const real = process.kill.bind(process);
+      vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) =>
+        pid < 0 && sig === 0 ? true : real(pid, sig as NodeJS.Signals)) as typeof process.kill);
+      const r = await node(`process.exit(0)`, { killGraceMs: 100 });
+      expect(r).toMatchObject({ status: 'exited', orphans: true, cleanup: 'failed' });
     });
   });
 });

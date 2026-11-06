@@ -9,8 +9,8 @@ import {
   PROBE_MAX_OUTPUT_BYTES,
   PROBE_TIMEOUT_MS,
   cancelled,
+  cleanupUnsafe,
   failure,
-  hasDuplicateKey,
   maskSecrets,
   parseJsonObject,
   parseSingleJsonObject,
@@ -116,8 +116,11 @@ export class CodexAgent implements Agent {
   private async diagnose(res: ProcessResult, signal?: AbortSignal): Promise<AgentResponse> {
     const detail = failureDetail(res);
     const probe = await this.exec(['login', 'status'], undefined, PROBE_TIMEOUT_MS, PROBE_MAX_OUTPUT_BYTES, signal);
-    if (probe.status === 'aborted' || signal?.aborted) return cancelled('codex'); // 취소를 일반 실행 실패로 바꾸지 않는다
-    if (probe.status === 'exited' && probe.exitCode === 1) {
+    // 정리 실패·취소는 인증 판정보다 우선하며 일반 실행 실패(EXECUTION, 재시도)로 바뀌지 않는다.
+    const unsafe = cleanupUnsafe('codex login status', probe); // 본 실행과 같은 정리 안전성 정책
+    if (unsafe) return { ok: false, error: unsafe, completedSteps: [] };
+    if (probe.status === 'aborted' || signal?.aborted) return cancelled('codex');
+    if (probe.status === 'exited' && !probe.orphans && probe.exitCode === 1) {
       return failure('AUTH', `codex is not logged in (codex login status): ${detail}`);
     }
     return failure('EXECUTION', `codex exited with code ${res.exitCode}: ${detail}`);
@@ -144,8 +147,7 @@ export class CodexAgent implements Agent {
  */
 function parseReview(text: string): { verdict: ReviewVerdict; feedback: string } | string {
   const obj = parseSingleJsonObject(text);
-  if (obj === null) return 'last message is not exactly one JSON object';
-  if (hasDuplicateKey(text, 'verdict') || hasDuplicateKey(text, 'feedback')) return 'duplicate keys make the review ambiguous';
+  if (obj === null) return 'last message is not exactly one JSON object without duplicate keys';
   const verdict = obj['verdict'];
   if (verdict !== 'approved' && verdict !== 'changes_requested') return 'verdict must be "approved" or "changes_requested"';
   const feedback = obj['feedback'];

@@ -9,6 +9,7 @@ export const proc = (over: Partial<ProcessResult> = {}): ProcessResult => ({
   stderr: '',
   truncated: false,
   cleanup: 'not_needed',
+  orphans: false,
   durationMs: 1,
   ...over,
 });

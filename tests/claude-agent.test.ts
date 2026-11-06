@@ -199,4 +199,61 @@ describe('ClaudeCodeAgent', () => {
     expect(isAbsolute(runner.specs[0]!.cwd)).toBe(true);
     expect(runner.specs[0]!.cwd).toBe(resolve(tmpdir()));
   });
+
+  describe('1. 종료 후 정리 안전성 정책 (본 실행)', () => {
+    const okOut = () => claudeResult({ result: report(['scaffold', 'wire-up']) });
+
+    it.each([['failed'], ['unverifiable']] as const)('exit 0 + 유효한 출력이어도 cleanup=%s 이면 UNAVAILABLE (성공으로 확정하지 않음)', async (cleanup) => {
+      const runner = new FakeRunner([() => proc({ stdout: okOut(), cleanup })]);
+      const res = await agent(runner).run(request());
+      expect(res).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+      expect(runner.specs).toHaveLength(1);
+    });
+
+    it('exit 0 + 유효한 출력이어도 잔존 프로세스가 있었다면(종료·확인됨) 결과를 신뢰하지 않고 EXECUTION', async () => {
+      const runner = new FakeRunner([() => proc({ stdout: okOut(), orphans: true, cleanup: 'confirmed' })]);
+      expect(await agent(runner).run(request())).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+    });
+
+    it('외부 SIGKILL로 종료된 뒤 정리에 실패하면 시그널 종료(EXECUTION)가 아니라 UNAVAILABLE', async () => {
+      const runner = new FakeRunner([() => proc({ exitCode: null, signal: 'SIGKILL', orphans: true, cleanup: 'failed' })]);
+      expect(await agent(runner).run(request())).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+    });
+  });
+
+  describe('2. 인증 probe에도 같은 정리 안전성 정책', () => {
+    const failedRun = () => proc({ exitCode: 1, stdout: claudeResult({ is_error: true, result: 'boom' }) });
+
+    it.each([['failed'], ['unverifiable']] as const)('probe cleanup=%s → UNAVAILABLE, 추가 CLI 실행 없음', async (cleanup) => {
+      const runner = new FakeRunner([failedRun, () => proc({ stdout: JSON.stringify({ loggedIn: true }), cleanup })]);
+      const res = await agent(runner).run(request());
+      expect(res).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+      expect(runner.specs).toHaveLength(2); // 본 실행 + probe뿐
+    });
+
+    it('probe가 loggedIn=false를 말해도 정리를 확인하지 못했으면 AUTH로 분류하지 않고 UNAVAILABLE', async () => {
+      const runner = new FakeRunner([failedRun, () => proc({ exitCode: 1, stdout: JSON.stringify({ loggedIn: false }), cleanup: 'failed' })]);
+      expect(await agent(runner).run(request())).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+    });
+
+    it('probe가 잔존 프로세스를 남겼다면(정리 확인됨) 그 결과는 신뢰하지 않고 EXECUTION', async () => {
+      const runner = new FakeRunner([failedRun, () => proc({ exitCode: 1, stdout: JSON.stringify({ loggedIn: false }), orphans: true, cleanup: 'confirmed' })]);
+      expect(await agent(runner).run(request())).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+    });
+
+    it('기존 정책 유지: 취소는 UNAVAILABLE, 정리가 확인된 loggedIn=false는 AUTH', async () => {
+      const ok = new FakeRunner([failedRun, () => proc({ exitCode: 1, stdout: JSON.stringify({ loggedIn: false }), cleanup: 'not_needed' })]);
+      expect(await agent(ok).run(request())).toMatchObject({ ok: false, error: { type: 'AUTH' } });
+    });
+  });
+
+  describe('3. 유니코드 이스케이프·중첩 중복 키', () => {
+    it.each([
+      ['일반 키 + 유니코드 이스케이프 키', String.raw`{"completedSteps":["scaffold"],"completedSteps":["scaffold","wire-up"],"summary":"x"}`],
+      ['중첩 객체의 중복 키', String.raw`{"completedSteps":["scaffold"],"summary":"x","meta":{"a":1,"a":2}}`],
+    ])('%s → EXECUTION 오류', async (_name, result) => {
+      const res = await agent(new FakeRunner([() => proc({ stdout: claudeResult({ result }) })])).run(request());
+      expect(res).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+    });
+  });
 });

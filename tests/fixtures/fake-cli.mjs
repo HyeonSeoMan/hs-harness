@@ -30,6 +30,16 @@ if (args[0] === 'login' && args[1] === 'status') {
   process.exit(sc.loggedIn === false ? 1 : 0);
 }
 
+// 부모가 정상 종료해도 같은 프로세스 그룹에 남아, 나중에 파일을 쓰려는 하위 프로세스 (SIGTERM 무시, 쓰기 시점은 leaveChildDelayMs)
+if (sc.leaveChildMarker) {
+  const { spawn } = await import('node:child_process');
+  spawn(
+    process.execPath,
+    ['-e', `process.on('SIGTERM',()=>{}); setTimeout(()=>require('fs').writeFileSync(${JSON.stringify(sc.leaveChildMarker)},'late'),${sc.leaveChildDelayMs ?? 700}); setInterval(()=>{},1000)`],
+    { stdio: 'ignore' },
+  );
+}
+
 if (sc.hang) setInterval(() => {}, 1000); // 종료 신호를 받을 때까지 대기
 
 if (args.includes('exec')) {

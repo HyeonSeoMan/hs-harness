@@ -7,8 +7,8 @@ import {
   PROBE_MAX_OUTPUT_BYTES,
   PROBE_TIMEOUT_MS,
   cancelled,
+  cleanupUnsafe,
   failure,
-  hasDuplicateKey,
   parseJsonObject,
   parseSingleJsonObject,
   processFailure,
@@ -99,7 +99,7 @@ export class ClaudeCodeAgent implements Agent {
     const report =
       typeof structured === 'object' && structured !== null && !Array.isArray(structured)
         ? (structured as Record<string, unknown>)
-        : typeof out['result'] === 'string' && !hasDuplicateKey(out['result'], 'completedSteps')
+        : typeof out['result'] === 'string'
           ? parseSingleJsonObject(out['result'], { allowSoleFence: true })
           : null;
     if (report === null) return failure('EXECUTION', 'claude finished but did not return exactly one valid JSON report');
@@ -120,16 +120,19 @@ export class ClaudeCodeAgent implements Agent {
   /** 구조화 신호가 없는 실패: 인증 상태를 명시적으로 확인한 뒤 AUTH 또는 EXECUTION으로 분류한다. */
   private async diagnose(detail: string, signal?: AbortSignal): Promise<AgentResponse> {
     const loggedIn = await this.probeLoggedIn(signal);
-    if (loggedIn === 'cancelled') return cancelled('claude'); // 인증 확인 중 취소를 일반 실행 실패로 바꾸지 않는다
+    // 정리 실패·취소는 인증 판정보다 우선하며 일반 실행 실패(EXECUTION, 재시도)로 바뀌지 않는다.
+    if (typeof loggedIn === 'object' && loggedIn !== null) return loggedIn;
     if (loggedIn === false) return failure('AUTH', `claude is not logged in (claude auth status): ${detail}`);
     return failure('EXECUTION', `claude failed: ${detail}`);
   }
 
   /** `claude auth status`의 loggedIn 값만 읽는다. 출력의 나머지(계정 정보)는 버린다. */
-  private async probeLoggedIn(signal?: AbortSignal): Promise<boolean | null | 'cancelled'> {
+  private async probeLoggedIn(signal?: AbortSignal): Promise<boolean | null | AgentResponse> {
     const res = await this.exec(['auth', 'status'], undefined, PROBE_TIMEOUT_MS, PROBE_MAX_OUTPUT_BYTES, signal);
-    if (res.status === 'aborted' || signal?.aborted) return 'cancelled';
-    if (res.status !== 'exited') return null;
+    const unsafe = cleanupUnsafe('claude auth status', res); // 본 실행과 같은 정리 안전성 정책
+    if (unsafe) return { ok: false, error: unsafe, completedSteps: [] };
+    if (res.status === 'aborted' || signal?.aborted) return cancelled('claude');
+    if (res.status !== 'exited' || res.orphans) return null; // 잔존 프로세스가 있었다면 판정을 신뢰하지 않는다
     const v = parseJsonObject(res.stdout.trim())?.['loggedIn'];
     return typeof v === 'boolean' ? v : null;
   }
