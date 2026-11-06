@@ -10,7 +10,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "demo": "node src/demo.ts"
+    "demo": "node src/demo.ts",
+    "manual:cli": "node scripts/manual-cli-check.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
