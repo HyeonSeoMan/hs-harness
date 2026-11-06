@@ -99,6 +99,18 @@ export interface ReviewRecord {
   at: string;
 }
 
+/**
+ * 현재 규칙의 완료 게이트(state-machine의 COMPLETED 전환)를 통과했다는 출처 기록.
+ * 이 기록이 있는 COMPLETED만 신뢰한다. 과거 데이터에는 소급해서 만들지 않는다.
+ */
+export interface CompletionProof {
+  revision: number;
+  /** 완료 근거가 된 마지막 검증·리뷰 기록의 시각 */
+  verificationAt: string;
+  reviewAt: string;
+  at: string;
+}
+
 export type PauseCause = 'AGENT_UNAVAILABLE' | 'INTERRUPTED' | 'VERIFIER_ERROR' | 'LEGACY_REVALIDATION';
 
 export interface Task {
@@ -110,6 +122,8 @@ export interface Task {
    * 검증·리뷰 기록은 자기 revision이 현재와 같을 때만 완료 판단에 쓰인다. Git 변경과는 아직 연결되지 않는다.
    */
   revision: number;
+  /** COMPLETED 게이트 통과 기록. COMPLETED가 아니면 null */
+  completion: CompletionProof | null;
   currentAgent: AgentId | null;
   /** 에이전트별 실행 시도 횟수 */
   attempts: Record<AgentId, number>;

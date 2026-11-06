@@ -1,0 +1,358 @@
+{
+  "version": 1,
+  "agents": {
+    "claude": "AVAILABLE",
+    "codex": "AVAILABLE"
+  },
+  "tasks": {
+    "bypass-no-verification": {
+      "id": "bypass-no-verification",
+      "description": "legacy bypass-no-verification",
+      "status": "COMPLETED",
+      "currentAgent": null,
+      "attempts": {
+        "claude": 1,
+        "codex": 1
+      },
+      "completedSteps": [
+        {
+          "id": "a",
+          "phase": "implement"
+        },
+        {
+          "id": "review",
+          "phase": "review"
+        }
+      ],
+      "remainingSteps": [],
+      "implementers": [
+        "claude"
+      ],
+      "checkpoint": null,
+      "fixRounds": 0,
+      "pendingFeedback": null,
+      "verifications": [],
+      "reviews": [
+        {
+          "round": 1,
+          "reviewer": "codex",
+          "verdict": "approved",
+          "feedback": "",
+          "independent": true,
+          "at": "2026-01-01T00:00:00.000Z",
+          "revision": 0
+        }
+      ],
+      "lastError": null,
+      "results": [],
+      "pauseCause": null,
+      "pauseReason": null,
+      "failureReason": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "revision": 0
+    },
+    "bypass-stale-pass": {
+      "id": "bypass-stale-pass",
+      "description": "legacy bypass-stale-pass",
+      "status": "COMPLETED",
+      "currentAgent": null,
+      "attempts": {
+        "claude": 1,
+        "codex": 1
+      },
+      "completedSteps": [
+        {
+          "id": "a",
+          "phase": "implement"
+        },
+        {
+          "id": "fix-1",
+          "phase": "implement"
+        },
+        {
+          "id": "review",
+          "phase": "review"
+        }
+      ],
+      "remainingSteps": [],
+      "implementers": [
+        "claude"
+      ],
+      "checkpoint": null,
+      "fixRounds": 1,
+      "pendingFeedback": null,
+      "verifications": [
+        {
+          "ok": true,
+          "summary": "checks passed",
+          "at": "2026-01-01T00:00:01.000Z",
+          "revision": 0
+        }
+      ],
+      "reviews": [
+        {
+          "round": 1,
+          "reviewer": "codex",
+          "verdict": "approved",
+          "feedback": "",
+          "independent": true,
+          "at": "2026-01-01T00:00:00.000Z",
+          "revision": 0
+        }
+      ],
+      "lastError": null,
+      "results": [],
+      "pauseCause": null,
+      "pauseReason": null,
+      "failureReason": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "revision": 0
+    },
+    "good-final": {
+      "id": "good-final",
+      "description": "legacy good-final",
+      "status": "COMPLETED",
+      "currentAgent": null,
+      "attempts": {
+        "claude": 1,
+        "codex": 1
+      },
+      "completedSteps": [
+        {
+          "id": "a",
+          "phase": "implement"
+        },
+        {
+          "id": "review",
+          "phase": "review"
+        }
+      ],
+      "remainingSteps": [],
+      "implementers": [
+        "claude"
+      ],
+      "checkpoint": null,
+      "fixRounds": 0,
+      "pendingFeedback": null,
+      "verifications": [
+        {
+          "ok": true,
+          "summary": "checks passed",
+          "at": "2026-01-01T00:00:01.000Z",
+          "revision": 0
+        }
+      ],
+      "reviews": [
+        {
+          "round": 1,
+          "reviewer": "codex",
+          "verdict": "approved",
+          "feedback": "",
+          "independent": true,
+          "at": "2026-01-01T00:00:00.000Z",
+          "revision": 0
+        }
+      ],
+      "lastError": null,
+      "results": [],
+      "pauseCause": null,
+      "pauseReason": null,
+      "failureReason": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "revision": 0
+    },
+    "verifying-final": {
+      "id": "verifying-final",
+      "description": "legacy verifying-final",
+      "status": "VERIFYING",
+      "currentAgent": null,
+      "attempts": {
+        "claude": 1,
+        "codex": 1
+      },
+      "completedSteps": [
+        {
+          "id": "a",
+          "phase": "implement"
+        },
+        {
+          "id": "review",
+          "phase": "review"
+        }
+      ],
+      "remainingSteps": [],
+      "implementers": [
+        "claude"
+      ],
+      "checkpoint": null,
+      "fixRounds": 0,
+      "pendingFeedback": null,
+      "verifications": [
+        {
+          "ok": true,
+          "summary": "checks passed",
+          "at": "2026-01-01T00:00:01.000Z",
+          "revision": 0
+        }
+      ],
+      "reviews": [
+        {
+          "round": 1,
+          "reviewer": "codex",
+          "verdict": "approved",
+          "feedback": "",
+          "independent": true,
+          "at": "2026-01-01T00:00:00.000Z",
+          "revision": 0
+        }
+      ],
+      "lastError": null,
+      "results": [],
+      "pauseCause": null,
+      "pauseReason": null,
+      "failureReason": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "revision": 1
+    },
+    "impl-named-review-2": {
+      "id": "impl-named-review-2",
+      "description": "legacy impl-named-review-2",
+      "status": "COMPLETED",
+      "currentAgent": null,
+      "attempts": {
+        "claude": 1,
+        "codex": 1
+      },
+      "completedSteps": [
+        {
+          "id": "review-2",
+          "phase": "implement"
+        },
+        {
+          "id": "review",
+          "phase": "review"
+        }
+      ],
+      "remainingSteps": [],
+      "implementers": [
+        "claude"
+      ],
+      "checkpoint": null,
+      "fixRounds": 0,
+      "pendingFeedback": null,
+      "verifications": [
+        {
+          "ok": true,
+          "summary": "checks passed",
+          "at": "2026-01-01T00:00:01.000Z",
+          "revision": 0
+        }
+      ],
+      "reviews": [
+        {
+          "round": 1,
+          "reviewer": "codex",
+          "verdict": "approved",
+          "feedback": "",
+          "independent": true,
+          "at": "2026-01-01T00:00:00.000Z",
+          "revision": 0
+        }
+      ],
+      "lastError": null,
+      "results": [],
+      "pauseCause": null,
+      "pauseReason": null,
+      "failureReason": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z",
+      "revision": 0
+    },
+    "native-completed": {
+      "id": "native-completed",
+      "description": "native f00cfc9 task",
+      "status": "COMPLETED",
+      "revision": 1,
+      "currentAgent": "codex",
+      "attempts": {
+        "claude": 1,
+        "codex": 1
+      },
+      "completedSteps": [
+        {
+          "id": "a",
+          "phase": "implement"
+        },
+        {
+          "id": "review",
+          "phase": "review"
+        }
+      ],
+      "remainingSteps": [],
+      "implementers": [
+        "claude"
+      ],
+      "checkpoint": {
+        "agent": "codex",
+        "lastCompletedStep": "review",
+        "note": "",
+        "at": "2026-01-01T00:00:00.000Z"
+      },
+      "fixRounds": 0,
+      "pendingFeedback": null,
+      "verifications": [
+        {
+          "revision": 1,
+          "ok": true,
+          "summary": "checks passed",
+          "at": "2026-01-01T00:00:00.000Z"
+        }
+      ],
+      "reviews": [
+        {
+          "revision": 1,
+          "round": 1,
+          "reviewer": "codex",
+          "verdict": "approved",
+          "feedback": "",
+          "independent": true,
+          "at": "2026-01-01T00:00:00.000Z"
+        }
+      ],
+      "lastError": null,
+      "results": [
+        {
+          "agent": "claude",
+          "phase": "implement",
+          "outcome": "success",
+          "errorType": null,
+          "message": "claude finished implement",
+          "completedSteps": [
+            "a"
+          ],
+          "at": "2026-01-01T00:00:00.000Z"
+        },
+        {
+          "agent": "codex",
+          "phase": "review",
+          "outcome": "success",
+          "errorType": null,
+          "message": "codex finished review",
+          "completedSteps": [
+            "review"
+          ],
+          "at": "2026-01-01T00:00:00.000Z"
+        }
+      ],
+      "pauseCause": null,
+      "pauseReason": null,
+      "failureReason": null,
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:00:00.000Z"
+    }
+  }
+}

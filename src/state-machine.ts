@@ -30,6 +30,16 @@ export function transition(task: Task, to: TaskStatus, at: string, patch: Partia
   if (to === 'COMPLETED') {
     const problems = verifyCompletion(next);
     if (problems.length > 0) throw new IncompleteTaskError(problems);
+    // verifyCompletion을 통과했으므로 검증·리뷰 기록이 존재한다.
+    return {
+      ...next,
+      completion: {
+        revision: next.revision,
+        verificationAt: next.verifications.at(-1)!.at,
+        reviewAt: next.reviews.at(-1)!.at,
+        at,
+      },
+    };
   }
   return next;
 }

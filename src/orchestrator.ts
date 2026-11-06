@@ -5,10 +5,11 @@ import {
   DuplicateTaskError,
   InvalidOptionError,
   ProgressError,
+  StateStoreError,
   TaskAlreadyRunningError,
   TaskNotFoundError,
 } from './errors.ts';
-import { agentStatusAfterError, isIndependentReview, roleAgent } from './policy.ts';
+import { AGENT_ERROR_TYPES, AGENT_IDS, AGENT_STATUSES, agentStatusAfterError, isIndependentReview, roleAgent } from './policy.ts';
 import { isTerminal, transition } from './state-machine.ts';
 import type { StateStore } from './store.ts';
 import {
@@ -62,6 +63,49 @@ function resolveLimit(name: string, value: number | undefined, fallback: number,
     throw new InvalidOptionError(`${name} must be an integer >= ${min} (got ${String(v)})`);
   }
   return v;
+}
+
+const malformed = (why: string): AgentResponse => ({
+  ok: false,
+  error: { type: 'EXECUTION', message: `Agent returned a malformed response: ${why}` },
+  completedSteps: [],
+});
+
+/**
+ * 에이전트 응답은 외부 입력이다. 내부 상태에 반영하기 전에 런타임에 검증하고 필요한 필드만 복사한다.
+ * 정의되지 않은 오류 유형은 EXECUTION(같은 에이전트 재시도, 시도 상한 적용)으로 정규화하고 원래 값을 메시지에 남긴다.
+ * 구조가 잘못된 응답은 진행 보고 없이 EXECUTION 오류로 취급한다. 성공으로 처리하지 않는다.
+ */
+function sanitizeResponse(raw: unknown): AgentResponse {
+  if (typeof raw !== 'object' || raw === null) return malformed('not an object');
+  const r = raw as Record<string, unknown>;
+  const steps = r['completedSteps'];
+  if (typeof r['ok'] !== 'boolean') return malformed('ok is not a boolean');
+  if (!Array.isArray(steps) || steps.some((x) => typeof x !== 'string')) return malformed('completedSteps is not a string array');
+  const completedSteps = [...(steps as string[])];
+  const note = typeof r['checkpointNote'] === 'string' ? { checkpointNote: r['checkpointNote'] } : {};
+
+  if (!r['ok']) {
+    const e = (typeof r['error'] === 'object' && r['error'] !== null ? r['error'] : {}) as Record<string, unknown>;
+    const message = typeof e['message'] === 'string' ? e['message'] : 'no error message';
+    const known = AGENT_ERROR_TYPES.find((t) => t === e['type']);
+    const error: AgentError = known
+      ? { type: known, message }
+      : { type: 'EXECUTION', message: `${message} (unknown error type: ${String(e['type']).slice(0, 40)})` };
+    return { ok: false, error, completedSteps, ...note };
+  }
+
+  const rv = r['review'];
+  const rr = (typeof rv === 'object' && rv !== null ? rv : null) as Record<string, unknown> | null;
+  const verdict = rr?.['verdict'] === 'approved' || rr?.['verdict'] === 'changes_requested' ? rr['verdict'] : null;
+  return {
+    ok: true,
+    completedSteps,
+    output: typeof r['output'] === 'string' ? r['output'] : '',
+    ...note,
+    // verdict가 유효하지 않으면 리뷰 없음으로 취급되어 "verdict 없는 리뷰" 오류가 된다.
+    ...(verdict !== null && { review: { verdict, feedback: typeof rr?.['feedback'] === 'string' ? rr['feedback'] : '' } }),
+  };
 }
 
 /**
@@ -262,7 +306,7 @@ export class Orchestrator {
 
     let response: AgentResponse;
     try {
-      response = await this.agents[agentId].run(request);
+      response = sanitizeResponse(await this.agents[agentId].run(request));
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       response = { ok: false, error: { type: 'EXECUTION', message: `Agent threw: ${message}` }, completedSteps: [] };
@@ -434,6 +478,12 @@ export class Orchestrator {
       tasks: { ...this.state.tasks, [task.id]: task },
       agents: { ...this.state.agents, ...agents },
     };
+    // 저장 직전 필수 불변식: 모든 에이전트가 유효한 상태를 가진다 (어긋나면 디스크에 쓰지 않는다).
+    for (const id of AGENT_IDS) {
+      if (!AGENT_STATUSES.includes(next.agents[id])) {
+        throw new StateStoreError(`Refusing to save: invalid status for agent ${id}: ${String(next.agents[id])}`);
+      }
+    }
     await this.store.save(structuredClone(next));
     this.state = next;
   }

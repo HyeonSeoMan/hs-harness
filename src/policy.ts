@@ -1,6 +1,8 @@
 import type { AgentErrorType, AgentId, AgentStatus, Phase } from './types.ts';
 
 export const AGENT_IDS: readonly AgentId[] = ['claude', 'codex'];
+export const AGENT_STATUSES: readonly AgentStatus[] = ['AVAILABLE', 'BUSY', 'RATE_LIMITED', 'UNAVAILABLE'];
+export const AGENT_ERROR_TYPES: readonly AgentErrorType[] = ['RATE_LIMIT', 'AUTH', 'NETWORK', 'EXECUTION', 'UNAVAILABLE'];
 
 /** v0.1 고정 역할: 구현/수정은 Claude, 리뷰는 Codex. 역할 전환은 후속 버전. */
 export function roleAgent(phase: Phase): AgentId {

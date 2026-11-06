@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { StateStoreError } from './errors.ts';
-import type { HarnessState } from './types.ts';
+import { AGENT_IDS, AGENT_STATUSES } from './policy.ts';
+import type { AgentStatus, HarnessState } from './types.ts';
 
 export interface StateStore {
   load(): Promise<HarnessState>;
@@ -70,8 +71,7 @@ function assertState(value: unknown, path: string): HarnessState {
     v.tasks !== null &&
     typeof v.agents === 'object' &&
     v.agents !== null &&
-    'claude' in v.agents &&
-    'codex' in v.agents;
+    AGENT_IDS.every((id) => AGENT_STATUSES.includes((v.agents as Record<string, AgentStatus>)[id] as AgentStatus));
   if (!ok) throw new StateStoreError(`State file has invalid structure: ${path}`);
   return v as HarnessState;
 }

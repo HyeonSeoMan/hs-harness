@@ -1,6 +1,7 @@
 import { ProgressError } from './errors.ts';
 import type { AgentId, Checkpoint, HarnessState, Phase, Step, Task } from './types.ts';
-import { isTerminal, transition } from './state-machine.ts';
+import { transition } from './state-machine.ts';
+import { verifyCompletion } from './verify.ts';
 
 export const REVIEW_STEP_ID = 'review';
 
@@ -24,6 +25,7 @@ export function newTask(input: NewTaskInput, at: string): Task {
     description,
     status: 'PENDING',
     revision: 0,
+    completion: null,
     currentAgent: null,
     attempts: { claude: 0, codex: 0 },
     completedSteps: [],
@@ -103,6 +105,17 @@ export function applyProgress(
 }
 
 /**
+ * 완료·남은 단계 전체에서 쓰이지 않은 `${prefix}-N` id를 할당한다(N은 from부터).
+ * 수정 루프와 마이그레이션이 같은 규칙을 쓰며, 사용자가 정한 구현 단계 id(예: review-2)와도 충돌하지 않는다.
+ */
+export function allocateStepId(task: Task, prefix: 'fix' | 'review', from: number): string {
+  const used = new Set([...task.completedSteps, ...task.remainingSteps].map((s) => s.id));
+  let n = from;
+  while (used.has(`${prefix}-${n}`)) n += 1;
+  return `${prefix}-${n}`;
+}
+
+/**
  * 검증 실패/리뷰 지적에 따른 수정 단계 계획. 수정 단계(fix-N)를 남은 단계 앞에 두고,
  * 남은 단계가 없으면(리뷰가 끝난 경우) 재리뷰 단계를 뒤에 붙인다.
  */
@@ -111,11 +124,11 @@ export function planFix(task: Task, feedback: string): Partial<Task> {
   const tail: Step[] =
     task.remainingSteps.length > 0
       ? task.remainingSteps
-      : [{ id: `review-${task.reviews.length + 1}`, phase: 'review' }];
+      : [{ id: allocateStepId(task, 'review', task.reviews.length + 1), phase: 'review' }];
   return {
     fixRounds: n,
     pendingFeedback: feedback,
-    remainingSteps: [{ id: `fix-${n}`, phase: 'implement' }, ...tail],
+    remainingSteps: [{ id: allocateStepId(task, 'fix', n), phase: 'implement' }, ...tail],
   };
 }
 
@@ -131,70 +144,91 @@ export function interrupt(task: Task, at: string, reason: string): Task {
   });
 }
 
-/** 남은 단계 끝에 붙일, 아직 쓰이지 않은 재리뷰 단계 id */
-function freshReviewStep(task: Task): Step {
-  const used = new Set([...task.completedSteps, ...task.remainingSteps].map((s) => s.id));
-  let n = task.reviews.length + 1;
-  while (used.has(`review-${n}`)) n += 1;
-  return { id: `review-${n}`, phase: 'review' };
+/** COMPLETED의 출처 기록이 있고 현재 기록과 일치하는지. 기록이 없으면 출처를 알 수 없으므로 신뢰하지 않는다. */
+function hasTrustedCompletion(task: Task): boolean {
+  const c = task.completion;
+  if (!c || c.revision !== task.revision) return false;
+  return (
+    c.verificationAt === task.verifications.at(-1)?.at &&
+    c.reviewAt === task.reviews.at(-1)?.at &&
+    verifyCompletion(task).length === 0
+  );
 }
 
 /**
- * revision 도입 이전(구버전)에 저장된 작업을 현재 규칙으로 올린다. 구버전 기록은 어떤 경로로 만들어졌는지
- * 알 수 없으므로(검증을 우회한 완료 포함) 현재 revision의 근거로 인정하지 않는다. 기록은 revision 0으로 보존하고
- * 작업은 revision 1로 올려 재검증과 재리뷰를 강제한다.
+ * 저장된 작업을 현재 규칙으로 정리한다. revision 필드가 있다는 사실은 기록이 신뢰할 만하다는 뜻이 아니다
+ * (구버전 변환기가 임의로 revision 0을 채웠을 수 있다). 그래서 COMPLETED의 신뢰는 completion 출처 기록으로만 판단하고,
+ * 그 기록은 현재 게이트(transition)가 새로 완료시킨 작업에만 생긴다. 과거 데이터에 소급해서 만들지 않는다.
  *  - FAILED: 그대로 둔다.
- *  - COMPLETED: 신뢰하지 않는다. 구현 결과(implement 완료 단계와 구현자)가 남아 있으면
- *    재리뷰 단계를 붙여 PAUSED(LEGACY_REVALIDATION)로 되돌리고 수동 resume을 기다린다.
- *    구현 결과가 없으면 복구할 수 없으므로 사유와 함께 FAILED로 둔다.
- *  - 그 외(미종료): 상태는 유지하되, 리뷰 단계가 사라진 경우(최종 완료 검증 대기 등) 재리뷰 단계를 붙인다.
- * 이 함수는 상태 머신 전환이 아니라 저장 형식 마이그레이션이며, 이미 올린 작업은 다시 바꾸지 않는다(멱등).
+ *  - 출처 기록 없는 COMPLETED: 신뢰하지 않는다. 기존 기록을 모두 이전 세대로 만들도록 revision을 올리고 재리뷰 단계를 붙여
+ *    PAUSED(LEGACY_REVALIDATION)로 되돌린다(수동 resume 후 재검증·독립 재리뷰). 구현 결과(완료된 implement 단계와 구현자)가
+ *    없으면 복구할 수 없으므로 사유와 함께 FAILED로 둔다.
+ *  - 미종료 작업: 상태는 유지한다. revision이 없던 구버전은 revision 1/기록 0으로 올리고, 최종 완료 검증 대기처럼
+ *    리뷰 단계가 없는데 현재 근거로는 완료할 수 없는 작업에는 재리뷰 단계를 붙인다.
+ * 상태 머신 전환이 아니라 저장 형식 정리이며 멱등이다: 정리된 작업은 위 조건에 다시 걸리지 않는다.
  */
 export function migrateLegacy(state: HarnessState, at: string): HarnessState {
   const tasks: Record<string, Task> = {};
   let changed = false;
-  for (const [id, task] of Object.entries(state.tasks)) {
-    if (typeof (task as Partial<Task>).revision === 'number') {
+  for (const [id, raw] of Object.entries(state.tasks)) {
+    const hadRevision = typeof (raw as Partial<Task>).revision === 'number';
+    const stale = !hadRevision || raw.verifications.some((v) => typeof v.revision !== 'number') || raw.reviews.some((r) => typeof r.revision !== 'number');
+    // 누락된 필드만 채우고 기존 값은 보존한다.
+    const task: Task = {
+      ...raw,
+      revision: hadRevision ? raw.revision : 0,
+      completion: raw.completion ?? null,
+      verifications: raw.verifications.map((v) => ({ ...v, revision: typeof v.revision === 'number' ? v.revision : 0 })),
+      reviews: raw.reviews.map((r) => ({ ...r, revision: typeof r.revision === 'number' ? r.revision : 0 })),
+    };
+    const fieldsChanged = !hadRevision || raw.completion === undefined || stale;
+    if (fieldsChanged) changed = true;
+
+    if (task.status === 'FAILED') {
       tasks[id] = task;
       continue;
     }
-    changed = true;
-    const kept = {
-      ...task,
-      verifications: task.verifications.map((v) => ({ ...v, revision: 0 })),
-      reviews: task.reviews.map((r) => ({ ...r, revision: 0 })),
-    };
-    if (task.status === 'FAILED') {
-      tasks[id] = { ...kept, revision: 0 };
+    if (task.status === 'COMPLETED' && hasTrustedCompletion(task)) {
+      tasks[id] = task;
       continue;
     }
-    const upgraded: Task = { ...kept, revision: 1 };
-    const needsReview = !upgraded.remainingSteps.some((s) => s.phase === 'review');
-    const withReview: Task = needsReview
-      ? { ...upgraded, remainingSteps: [...upgraded.remainingSteps, freshReviewStep(upgraded)] }
-      : upgraded;
-    if (task.status !== 'COMPLETED') {
-      tasks[id] = withReview;
-    } else if (
-      task.implementers.length > 0 &&
-      task.completedSteps.some((s) => s.phase === 'implement')
-    ) {
+
+    // 이 아래는 기존 기록을 현재 근거로 쓸 수 없는 작업이다. 모든 기록이 이전 세대가 되도록 revision을 올린다.
+    const untrustedCompleted = task.status === 'COMPLETED';
+    const newest = Math.max(task.revision, ...task.verifications.map((v) => v.revision), ...task.reviews.map((r) => r.revision));
+    const base: Task = untrustedCompleted || !hadRevision ? { ...task, revision: newest + 1, completion: null } : task;
+    const needsReview =
+      !base.remainingSteps.some((s) => s.phase === 'review') && (untrustedCompleted || verifyCompletion(base).length > 0);
+    const next: Task = needsReview
+      ? {
+          ...base,
+          remainingSteps: [
+            ...base.remainingSteps,
+            { id: allocateStepId(base, 'review', base.reviews.length + 1), phase: 'review' },
+          ],
+        }
+      : base;
+    if (untrustedCompleted || needsReview) changed = true;
+
+    if (!untrustedCompleted) {
+      tasks[id] = next;
+    } else if (next.implementers.length > 0 && next.completedSteps.some((s) => s.phase === 'implement')) {
       tasks[id] = {
-        ...withReview,
+        ...next,
         status: 'PAUSED',
         pauseCause: 'LEGACY_REVALIDATION',
         pauseReason:
-          'Completed by a pre-revision version whose verification/review cannot be trusted. Manual resume re-verifies and re-reviews the existing implementation.',
+          'COMPLETED without a trusted completion record (legacy or unknown origin). Manual resume re-verifies and re-reviews the existing implementation.',
         failureReason: null,
         updatedAt: at,
       };
     } else {
       tasks[id] = {
-        ...kept,
-        revision: 1,
+        ...next,
+        remainingSteps: base.remainingSteps,
         status: 'FAILED',
         failureReason:
-          'Legacy COMPLETED task cannot be revalidated: no completed implement step or implementer is recorded.',
+          'COMPLETED task of unknown origin cannot be revalidated: no completed implement step or implementer is recorded.',
         updatedAt: at,
       };
     }
