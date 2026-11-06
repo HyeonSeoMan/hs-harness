@@ -1,0 +1,20 @@
+{
+  "name": "hs-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code / Codex 범용 코딩 하네스 - Orchestrator Core",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "demo": "node src/demo.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

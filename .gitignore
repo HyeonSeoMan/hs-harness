@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build / test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# environment (예시 파일만 허용)
+.env
+.env.*
+!.env.example
+
+# logs / temp
+*.log
+npm-debug.log*
+pnpm-debug.log*
+*.tmp
+*.temp
+.DS_Store
+
+# orchestrator local state & checkpoints
+.harness/
+state.json
+state.json.*.tmp
