@@ -256,4 +256,25 @@ describe('ClaudeCodeAgent', () => {
       expect(res).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
     });
   });
+
+  describe('3. 인증 probe는 정상 종료한 출력만 판정에 사용한다', () => {
+    const failedRun = () => proc({ exitCode: 1, stdout: claudeResult({ is_error: true, result: 'boom' }) });
+    const loggedOut = JSON.stringify({ loggedIn: false });
+
+    it.each([
+      ['SIGKILL 시그널 종료 (loggedIn:false를 출력한 뒤)', { exitCode: null, signal: 'SIGKILL' as const, stdout: loggedOut }],
+      ['SIGTERM 시그널 종료', { exitCode: null, signal: 'SIGTERM' as const, stdout: loggedOut }],
+      ['비정상 종료 코드(2)', { exitCode: 2, stdout: loggedOut }],
+      ['종료 코드와 출력이 모순(exit 0 + loggedIn:false)', { exitCode: 0, stdout: loggedOut }],
+      ['종료 코드와 출력이 모순(exit 1 + loggedIn:true)', { exitCode: 1, stdout: JSON.stringify({ loggedIn: true }) }],
+    ])('%s → AUTH로 확정하지 않고 EXECUTION', async (_name, probe) => {
+      const runner = new FakeRunner([failedRun, () => proc(probe)]);
+      expect(await agent(runner).run(request())).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+    });
+
+    it('정상 로그아웃 응답(exit 1 + loggedIn:false)은 계속 AUTH', async () => {
+      const runner = new FakeRunner([failedRun, () => proc({ exitCode: 1, stdout: loggedOut })]);
+      expect(await agent(runner).run(request())).toMatchObject({ ok: false, error: { type: 'AUTH' } });
+    });
+  });
 });

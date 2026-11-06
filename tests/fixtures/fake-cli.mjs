@@ -40,6 +40,14 @@ if (sc.leaveChildMarker) {
   );
 }
 
+// 별도 프로세스 그룹으로 이탈해 stdout/stderr 파이프를 계속 붙들고 있는 자식 (그룹 종료로는 정리할 수 없다)
+if (sc.holdPipesPidFile) {
+  const { spawn } = await import('node:child_process');
+  const holder = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'inherit' });
+  writeFileSync(sc.holdPipesPidFile, String(holder.pid));
+  holder.unref();
+}
+
 if (sc.hang) setInterval(() => {}, 1000); // 종료 신호를 받을 때까지 대기
 
 if (args.includes('exec')) {

@@ -132,9 +132,14 @@ export class ClaudeCodeAgent implements Agent {
     const unsafe = cleanupUnsafe('claude auth status', res); // 본 실행과 같은 정리 안전성 정책
     if (unsafe) return { ok: false, error: unsafe, completedSteps: [] };
     if (res.status === 'aborted' || signal?.aborted) return cancelled('claude');
-    if (res.status !== 'exited' || res.orphans) return null; // 잔존 프로세스가 있었다면 판정을 신뢰하지 않는다
+    // 정상 종료(시그널 없이 종료 코드 0/1)한 probe의 출력만 판정에 쓴다. 시그널 종료·비정상 종료·잔존 프로세스가 있었던 실행은
+    // 출력이 일부만 나왔거나 믿을 수 없으므로 인증 미확인(null)이다. 종료 코드와 출력이 어긋나도 미확인이다
+    // (실제 확인한 계약: 로그인 상태는 exit 0, 로그아웃은 exit 1).
+    if (res.status !== 'exited' || res.orphans || res.signal !== null) return null;
     const v = parseJsonObject(res.stdout.trim())?.['loggedIn'];
-    return typeof v === 'boolean' ? v : null;
+    if (v === true && res.exitCode === 0) return true;
+    if (v === false && res.exitCode === 1) return false;
+    return null;
   }
 
   private exec(args: string[], stdin: string | undefined, timeoutMs: number, maxOutputBytes: number, signal?: AbortSignal) {

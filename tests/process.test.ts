@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getEventListeners } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runProcess, type ProcessSpec } from '../src/cli/process.ts';
+import { runProcess, type ProcessResult, type ProcessSpec } from '../src/cli/process.ts';
 
 const node = (code: string, over: Partial<ProcessSpec> = {}) =>
   runProcess({
@@ -283,5 +284,128 @@ describe('프로세스 실행기', () => {
       const r = await node(`process.exit(0)`, { killGraceMs: 100 });
       expect(r).toMatchObject({ status: 'exited', orphans: true, cleanup: 'failed' });
     });
+  });
+
+  describe('1-c. exit·close·timeout·abort 가 어떤 순서로 일어나도 유한 시간 안에 한 번만 확정한다', () => {
+    const pidFiles: string[] = [];
+    afterEach(() => {
+      // 그룹을 이탈해 파이프를 붙든 프로세스는 실행기가 정리하지 않으므로 테스트가 직접 치운다.
+      for (const f of pidFiles.splice(0)) {
+        try {
+          const pid = Number(readFileSync(f, 'utf8'));
+          if (Number.isInteger(pid) && pid > 1) process.kill(pid, 'SIGKILL');
+        } catch {
+          // 파일이 없거나 이미 종료됨
+        }
+      }
+    });
+
+    /** 기한 안에 확정되지 않으면 원인을 알 수 있는 오류로 실패시킨다 (vitest의 일반 타임아웃보다 진단이 쉽다). */
+    const settlesWithin = async <T,>(p: Promise<T>, ms: number): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          p,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`runner did not settle within ${ms}ms`)), ms);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer); // 테스트 쪽 타이머가 남아 실행기의 타이머 정리 검증을 흐리지 않게 한다
+      }
+    };
+
+    /**
+     * 별도 프로세스 그룹(detached)의 자식이 부모의 stdout/stderr 파이프를 계속 붙든다.
+     * parent: 'exit' = 부모가 바로 정상 종료, 'hang' = 부모가 계속 살아 있음, 'plain' = 붙드는 자식 없이 부모만 hang
+     */
+    const holderScript = (pidFile: string, parent: 'exit' | 'hang' | 'plain') => `
+      ${parent === 'plain' ? '' : `const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'inherit' });
+      require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));`}
+      ${parent === 'exit' ? 'process.exit(0)' : 'setInterval(() => {}, 1000)'}`;
+
+    const run = async (parent: 'exit' | 'hang' | 'plain', over: Partial<ProcessSpec> = {}) => {
+      const pidFile = join(await mkdtemp(join(tmpdir(), 'hs-pipe-')), 'pid');
+      pidFiles.push(pidFile);
+      return node(holderScript(pidFile, parent), { killGraceMs: 50, ...over });
+    };
+
+    it('Codex 재현: 부모 정상 종료 + 이탈한 자식이 파이프 유지 + timeout 200ms + 400ms abort 도 유한 시간에 반환', async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 400);
+      const started = Date.now();
+      const r = await settlesWithin(run('exit', { timeoutMs: 200, signal: ac.signal }), 4000);
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(r.status).toBe('timeout'); // 먼저 일어난 요청이 원인
+      expect(r.cleanup).toBe('unverifiable'); // 파이프를 붙든 프로세스를 정리했다고 주장하지 않는다
+    });
+
+    it('종료 요청이 전혀 없어도(부모 정상 종료 + 파이프 유지) 제한 시간 뒤 unverifiable 로 반환한다', async () => {
+      const r = await settlesWithin(run('exit', { timeoutMs: 20_000 }), 4000);
+      expect(r).toMatchObject({ status: 'exited', exitCode: 0, cleanup: 'unverifiable', orphans: false });
+    });
+
+    it('부모가 살아 있는 채 timeout: 부모 그룹은 정리되고 이탈한 파이프 보유자 때문에 unverifiable', async () => {
+      const r = await settlesWithin(run('hang', { timeoutMs: 200 }), 4000);
+      expect(r.status).toBe('timeout');
+      expect(r.cleanup).toBe('unverifiable');
+    });
+
+    it('정상 종료·정리 경로는 그대로 성공한다 (회귀 방지)', async () => {
+      const started = Date.now();
+      const r = await settlesWithin(node(`console.log('ok')`), 3000);
+      expect(r).toMatchObject({ status: 'exited', exitCode: 0, cleanup: 'not_needed', orphans: false, stdout: 'ok\n' });
+      expect(Date.now() - started).toBeLessThan(1500); // 파이프 유예(수 초)를 기다리지 않는다
+    });
+
+    it('부모 종료 직후 쏟아진 큰 출력도 close 까지 모두 수집한다', async () => {
+      const r = await settlesWithin(node(`process.stdout.write('x'.repeat(500000), () => process.exit(0))`), 5000);
+      expect(r).toMatchObject({ status: 'exited', exitCode: 0, cleanup: 'not_needed' });
+      expect(r.stdout).toHaveLength(500000);
+    });
+
+    it('timeout·abort 조합 × 부모/파이프 상태 전체에서 유한 시간 내 반환하고 원인이 첫 요청이다', async () => {
+      type Case = { parent: 'exit' | 'hang' | 'plain'; stop: 'timeout' | 'abort' | 'both'; expect: ProcessResult['status']; cleanup: ProcessResult['cleanup'][] };
+      const cases: Case[] = [
+        { parent: 'exit', stop: 'timeout', expect: 'timeout', cleanup: ['unverifiable'] },
+        { parent: 'exit', stop: 'abort', expect: 'aborted', cleanup: ['unverifiable'] },
+        { parent: 'exit', stop: 'both', expect: 'timeout', cleanup: ['unverifiable'] },
+        { parent: 'hang', stop: 'timeout', expect: 'timeout', cleanup: ['unverifiable'] },
+        { parent: 'hang', stop: 'abort', expect: 'aborted', cleanup: ['unverifiable'] },
+        { parent: 'hang', stop: 'both', expect: 'timeout', cleanup: ['unverifiable'] },
+        { parent: 'plain', stop: 'timeout', expect: 'timeout', cleanup: ['confirmed'] },
+        { parent: 'plain', stop: 'both', expect: 'timeout', cleanup: ['confirmed'] },
+      ];
+      for (const c of cases) {
+        const ac = new AbortController();
+        const over: Partial<ProcessSpec> = { signal: ac.signal, timeoutMs: c.stop === 'abort' ? 20_000 : 200 };
+        if (c.stop !== 'timeout') setTimeout(() => ac.abort(), c.stop === 'abort' ? 200 : 350);
+        const label = JSON.stringify(c);
+        const started = Date.now();
+        const r = await settlesWithin(run(c.parent, over), 4500);
+        expect(Date.now() - started, label).toBeLessThan(4500);
+        expect(r.status, label).toBe(c.expect);
+        expect(c.cleanup, label).toContain(r.cleanup);
+        expect(getEventListeners(ac.signal, 'abort'), label).toHaveLength(0); // 리스너 정리
+      }
+    }, 40_000);
+
+    it('어떤 종료 경로에서도 abort 리스너와 타이머를 남기지 않는다', async () => {
+      const timersBefore = process.getActiveResourcesInfo().filter((x) => x === 'Timeout').length;
+      for (const mode of ['normal', 'timeout', 'abort', 'pipe'] as const) {
+        const ac = new AbortController();
+        if (mode === 'abort') setTimeout(() => ac.abort(), 150);
+        const r =
+          mode === 'normal'
+            ? await node(`1`, { signal: ac.signal })
+            : mode === 'pipe'
+              ? await settlesWithin(run('exit', { signal: ac.signal, timeoutMs: 20_000 }), 4000)
+              : await settlesWithin(node(`setInterval(()=>{},1000)`, { signal: ac.signal, timeoutMs: mode === 'timeout' ? 150 : 20_000 }), 4000);
+        expect(getEventListeners(ac.signal, 'abort'), mode).toHaveLength(0);
+        expect(r.status).not.toBe('spawn_failed');
+      }
+      await new Promise((res) => setTimeout(res, 100));
+      expect(process.getActiveResourcesInfo().filter((x) => x === 'Timeout').length).toBeLessThanOrEqual(timersBefore);
+    }, 30_000);
   });
 });

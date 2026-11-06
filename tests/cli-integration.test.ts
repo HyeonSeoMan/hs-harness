@@ -1,10 +1,10 @@
 // 가짜 CLI(tests/fixtures/fake-cli.mjs)를 실제 프로세스로 실행해 어댑터 ↔ 오케스트레이터 연동을 검증한다.
 // 실제 claude/codex를 호출하지 않으므로 사용량을 쓰지 않는다.
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { Agent } from '../src/agent.ts';
 import { ClaudeCodeAgent } from '../src/cli/claude.ts';
 import { CodexAgent } from '../src/cli/codex.ts';
@@ -344,6 +344,79 @@ describe('Codex 2차 리뷰 결함 수정 후의 오케스트레이터 수준 �
       expect(JSON.stringify(claude.calls)).not.toContain(secret);
       expect(JSON.stringify(t)).not.toContain(secret);
       expect(JSON.stringify(await store.load())).not.toContain(secret);
+    }
+  });
+});
+
+describe('Codex 3차 리뷰 결함 수정 후의 오케스트레이터 수준 보장', () => {
+  /** 별도 프로세스 그룹으로 이탈해 파이프를 붙든 자식. 실행기는 정리할 수 없으므로 테스트가 직접 치운다. */
+  const holders: string[] = [];
+  const killHolders = () => {
+    for (const f of holders.splice(0)) {
+      try {
+        const pid = Number(readFileSync(f, 'utf8'));
+        if (Number.isInteger(pid) && pid > 1) process.kill(pid, 'SIGKILL');
+      } catch {
+        // 없거나 이미 종료됨
+      }
+    }
+  };
+  afterEach(killHolders);
+
+  it('1. 파이프를 붙든 이탈 자식이 있으면 종료 코드 0이어도 정리 불확실 → UNAVAILABLE → PAUSED, 자동 재시도 없음', async () => {
+    const dir = await makeEnvDir();
+    const log = join(dir, 'calls.jsonl');
+    const pidFile = join(dir, 'holder.pid');
+    holders.push(pidFile);
+    const claude = new ClaudeCodeAgent(fake({ ...claudeOk(['implement']), holdPipesPidFile: pidFile }, { FAKE_LOG: log }));
+    const codex = new MockAgent('codex');
+    const orch = await orchestrate(claude, codex, { maxAttempts: 5 });
+    await orch.createTask({ id: 't1', description: 'x' });
+
+    const started = Date.now();
+    const t = await orch.run('t1');
+    expect(Date.now() - started).toBeLessThan(8000); // 무한 대기하지 않는다
+    expect(t.status).toBe('PAUSED');
+    expect(t.pauseCause).toBe('AGENT_UNAVAILABLE');
+    expect(t.lastError?.type).toBe('UNAVAILABLE');
+    expect(t.completedSteps).toEqual([]); // 정상 종료 + 유효한 출력이어도 구현을 완료로 기록하지 않는다
+    expect(t.completion).toBeNull();
+    expect((await readFile(log, 'utf8')).trim().split('\n')).toHaveLength(1); // CLI는 한 번만 실행됨
+    expect(codex.calls).toHaveLength(0);
+  });
+
+  it('1. 같은 상황에서 timeout/취소가 겹쳐도 유한 시간 내 UNAVAILABLE 로 반환한다', async () => {
+    const pidFile = join(await makeEnvDir(), 'holder.pid');
+    holders.push(pidFile);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 400);
+    const started = Date.now();
+    const res = await new ClaudeCodeAgent({ ...fake({ ...claudeOk(['implement']), holdPipesPidFile: pidFile }), timeoutMs: 200 }).run(
+      request({ remainingSteps: ['implement'] }),
+      { signal: ac.signal },
+    );
+    expect(Date.now() - started).toBeLessThan(8000);
+    expect(res).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+  });
+
+  it('2. 내부 공백·반대 따옴표가 있는 비밀값은 반환값·저장된 상태·다음 구현 요청 어디에도 남지 않는다', async () => {
+    const pieces = ['synthetic phrase 123456', 'Quoted123', 'correct horse battery'];
+    const feedback = `Remove:\npassword: "synthetic phrase 123456"\nclient_secret = "synthetic'Quoted123"\napi_key = "correct horse battery staple"\nkeep \`const password = getPassword();\``;
+    for (const verdict of ['changes_requested', 'approved'] as const) {
+      let n = 0;
+      const codex: Agent = {
+        id: 'codex',
+        run: (req, opts) =>
+          new CodexAgent(fake(n++ === 0 ? codexVerdict(verdict, feedback) : codexVerdict('approved'))).run(req, opts),
+      };
+      const claude = new MockAgent('claude');
+      const { orch, store } = await orchestrateWithStore(claude, codex);
+      await orch.createTask({ id: 't1', description: 'x' });
+      const t = await orch.run('t1');
+      expect(t.status).toBe('COMPLETED');
+      const everything = JSON.stringify([t, await store.load(), claude.calls]);
+      for (const piece of pieces) expect(everything, `${verdict}: ${piece}`).not.toContain(piece);
+      expect(t.reviews[0]?.feedback).toContain('const password = getPassword();'); // 일반 코드는 보존
     }
   });
 });

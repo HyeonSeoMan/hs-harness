@@ -322,4 +322,27 @@ describe('CodexAgent', () => {
       expect(fb).toContain('then rotate it.');
     });
   });
+
+  it('3. (일관성) codex login status 가 시그널로 종료되면 로그아웃으로 확정하지 않는다', async () => {
+    const runner = new FakeRunner([
+      () => proc({ exitCode: 1, stdout: '{"type":"turn.failed","error":{"message":"boom"}}\n' }),
+      () => proc({ exitCode: null, signal: 'SIGKILL' }),
+    ]);
+    expect(await agent(runner).run(reviewReq())).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+  });
+
+  describe('2. 인용된 비밀값이 든 리뷰 피드백 (내부 공백·반대 따옴표)', () => {
+    it.each([
+      ['password: "synthetic phrase 123456"', ['synthetic phrase', '123456']],
+      [`client_secret = "synthetic'Quoted123"`, ['Quoted123']],
+    ])('%s', async (line, leaked) => {
+      const feedback = `Please remove:\n${line}\nand rotate it.`;
+      for (const verdict of ['changes_requested', 'approved'] as const) {
+        const res = await agent(new FakeRunner([writes(JSON.stringify({ verdict, feedback }))])).run(reviewReq());
+        expect(res).toMatchObject({ ok: true, review: { verdict } });
+        for (const piece of leaked) expect(JSON.stringify(res)).not.toContain(piece);
+        expect((res as { review: { feedback: string } }).review.feedback).toContain('and rotate it.');
+      }
+    });
+  });
 });

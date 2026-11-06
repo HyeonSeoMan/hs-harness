@@ -62,6 +62,27 @@ export interface ProcessRunner {
 
 export const spawnRunner: ProcessRunner = { run: runProcess };
 
+/*
+ * ── 실행 종료의 상태 전이 ──────────────────────────────────────────────────────────
+ * 서로 독립적인 사건 (어떤 순서로 와도 된다):
+ *   exit            부모 프로세스가 끝남                    → `parent`
+ *   close           stdout/stderr 파이프가 모두 닫힘        → `pipesClosed`
+ *                   (exit 와는 별개다: 프로세스 그룹 밖의 프로세스가 파이프를 붙들면 오지 않을 수 있다)
+ *   timeout/abort/output_limit   종료 요청                  → `cause`(첫 요청만 기록) + 그룹 정리 절차 시작
+ *
+ * 그룹 정리 절차 `procedure`: idle → running → done. SIGTERM → (유예) → SIGKILL → 그룹이 비었는지 확인.
+ *   정확히 한 번만 실행된다. 시작 조건은 두 가지뿐이다: ① 종료 요청 ② 종료 요청 없이 부모가 끝났는데 같은 그룹에 프로세스가 남음.
+ *   "시작되었는가"만 나타내며 다른 의미로 쓰지 않는다 (이전 버전은 이 플래그가 '검사 중'도 뜻해서 이후 timeout/abort 가 무시됐다).
+ *
+ * 결과 확정 `finish()` 는 아래 중 먼저 성립하는 하나로 정확히 한 번 일어난다:
+ *   A. 부모 exit ∧ 잔존 검사 끝 ∧ procedure 가 running 이 아님 ∧ close   → 정상 확정
+ *   B. A 에서 close 만 없음 → PIPE_DRAIN_MS 뒤 확정하고 cleanup 을 unverifiable 로 한다
+ *      (그룹 밖에서 파이프를 붙든 프로세스가 남아 있을 수 있고, 그것은 종료하지 못한다)
+ *   C. procedure 가 failed/unverifiable 로 끝남 → 즉시 확정
+ *   D. 하드 데드라인 (종료 요청 또는 부모 종료 시점부터 유한) → 강제 확정, cleanup 은 최소 unverifiable
+ * 모든 대기에 상한이 있으므로 이벤트 순서와 무관하게 유한 시간 안에 끝난다. 한계: 프로세스 그룹을 이탈한 자손은
+ * 종료할 수 없으며, 그런 자손이 파이프를 붙들고 있는 경우에만 B/D 로 감지해 unverifiable 로 보고한다.
+ */
 export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
   const started = Date.now();
   const empty = (status: ProcessStatus, error?: ProcessResult['error']): ProcessResult => ({
@@ -90,19 +111,39 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
   const env: Record<string, string | undefined> = { ...process.env, ...spec.env };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
 
+  const grace = spec.killGraceMs ?? 2000;
+  const win32 = process.platform === 'win32';
+
   return new Promise<ProcessResult>((resolve) => {
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     const sizes = { out: 0, err: 0 };
-    let cause: ProcessStatus | null = null; // 종료를 유발한 첫 원인
     let truncated = false;
-    let settled = false;
-    let terminating = false;
-    let cleanupDone = true; // 종료를 요청하면 그룹 정리가 끝날 때까지 false
+
+    // ── 상태 (위 문서 참고)
+    let parent: { code: number | null; signal: NodeJS.Signals | null } | null = null; // exit
+    let pipesClosed = false; // close
+    let cause: ProcessStatus | null = null; // 첫 종료 요청
+    let procedure: 'idle' | 'running' | 'done' = 'idle';
+    let inspecting = false; // 부모 종료 직후 잔존 프로세스 검사 중
     let cleanup: GroupCleanup = 'not_needed';
     let orphans = false;
-    let closed: { code: number | null; signal: NodeJS.Signals | null } | null = null;
-    const timers: NodeJS.Timeout[] = [];
+    let settled = false;
+
+    // ── 타이머: 전부 추적하고 finish 에서 한꺼번에 해제한다
+    const timers = new Set<NodeJS.Timeout>();
+    const later = (ms: number, fn: () => void): NodeJS.Timeout => {
+      const t = setTimeout(() => {
+        timers.delete(t);
+        fn();
+      }, ms);
+      timers.add(t);
+      return t;
+    };
+    const sleep = (ms: number) => new Promise<void>((r) => later(ms, r));
+    let pipeTimer: NodeJS.Timeout | undefined;
+    let hardTimer: NodeJS.Timeout | undefined;
+    let hardAt = 0;
 
     let child: ChildProcess;
     try {
@@ -112,7 +153,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
         shell: false,
         stdio: ['pipe', 'pipe', 'pipe'],
         // 자식이 만든 하위 프로세스까지 한 번에 종료할 수 있도록 별도 프로세스 그룹으로 실행한다.
-        detached: process.platform !== 'win32',
+        detached: !win32,
         windowsHide: true,
       });
     } catch (e) {
@@ -121,21 +162,23 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
       return;
     }
 
-    const onAbort = () => stop('aborted');
-    spec.signal?.addEventListener('abort', onAbort, { once: true });
-    if (spec.signal?.aborted) stop('aborted'); // 리스너 등록 전에 취소된 경우에 대한 방어
+    const onAbort = () => requestStop('aborted');
 
-    const finish = (status: ProcessStatus, exitCode: number | null, signal: NodeJS.Signals | null, error?: ProcessResult['error']) => {
+    /** 결과 확정. 정확히 한 번만 실행되며 타이머·리스너·핸들을 모두 해제한다. */
+    function finish(status?: ProcessStatus, error?: ProcessResult['error']): void {
       if (settled) return;
       settled = true;
       for (const t of timers) clearTimeout(t);
+      timers.clear();
       spec.signal?.removeEventListener('abort', onAbort);
       child.stdout?.destroy();
       child.stderr?.destroy();
+      child.stdin?.destroy();
+      child.unref(); // 정리하지 못한 프로세스가 있어도 이 핸들이 호출자를 붙들지 않는다
       resolve({
-        status,
-        exitCode,
-        signal,
+        status: status ?? cause ?? 'exited',
+        exitCode: parent?.code ?? null,
+        signal: parent?.signal ?? null,
         stdout: Buffer.concat(out).toString('utf8'),
         stderr: Buffer.concat(err).toString('utf8'),
         truncated,
@@ -144,17 +187,17 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
         durationMs: Date.now() - started,
         ...(error && { error }),
       });
+    }
+
+    /** 정리 결과는 나빠지는 방향으로만 바뀐다 (confirmed 가 failed/unverifiable 를 덮어쓰지 않는다). */
+    const worsen = (next: GroupCleanup) => {
+      const rank: Record<GroupCleanup, number> = { not_needed: 0, confirmed: 1, unverifiable: 2, failed: 3 };
+      if (rank[next] > rank[cleanup]) cleanup = next;
     };
 
-    /** 부모 종료(close)와 프로세스 그룹 정리가 모두 끝났을 때만 결과를 확정한다. */
-    const tryFinish = () => {
-      if (settled || closed === null || !cleanupDone) return;
-      finish(cause ?? 'exited', closed.code, closed.signal);
-    };
-
-    const kill = (sig: NodeJS.Signals) => {
+    const killGroup = (sig: NodeJS.Signals) => {
       try {
-        if (process.platform !== 'win32' && child.pid !== undefined) process.kill(-child.pid, sig);
+        if (!win32 && child.pid !== undefined) process.kill(-child.pid, sig);
         else child.kill(sig);
       } catch {
         try {
@@ -167,7 +210,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
 
     /** 프로세스 그룹에 살아 있는 프로세스가 있는지 (신호 0은 전달 없이 존재만 확인한다). */
     const groupAlive = (): boolean => {
-      if (child.pid === undefined) return false;
+      if (win32 || child.pid === undefined) return false;
       try {
         process.kill(-child.pid, 0);
         return true;
@@ -181,66 +224,104 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
       for (;;) {
         if (!groupAlive()) return true;
         if (settled || Date.now() >= end) return false;
-        await new Promise((r) => setTimeout(r, 20));
+        await sleep(20);
       }
     };
 
-    /**
-     * SIGTERM → (유예) → SIGKILL 로 그룹 전체를 종료하고, 그룹이 비었는지 확인한다.
-     * 부모가 먼저 종료돼도 SIGKILL 예약과 확인은 취소되지 않는다.
-     */
-    async function terminateGroup(): Promise<void> {
-      const grace = spec.killGraceMs ?? 2000;
-      kill('SIGTERM');
-      if (process.platform === 'win32') {
-        cleanup = 'unverifiable';
-        await new Promise((r) => setTimeout(r, grace));
-        kill('SIGKILL');
-      } else if (await waitGroupGone(grace)) {
-        cleanup = 'confirmed';
-      } else {
-        kill('SIGKILL');
-        cleanup = (await waitGroupGone(KILL_CONFIRM_MS)) ? 'confirmed' : 'failed';
+    /** 확정 조건 A/B 를 평가한다. 상태가 바뀔 때마다 호출한다. */
+    function evaluate(): void {
+      if (settled || parent === null || inspecting || procedure === 'running') return;
+      if (pipesClosed) {
+        finish(); // A
+        return;
       }
-      cleanupDone = true;
-      if (closed !== null) tryFinish();
-      else if (cleanup === 'confirmed') timers.push(setTimeout(() => finish(cause ?? 'exited', null, null), CLOSE_WAIT_MS));
-      else finish(cause ?? 'exited', null, null); // 정리를 확인하지 못했다: 파이프를 붙든 프로세스를 기다리지 않고 그대로 보고한다
+      // B: 부모와 그룹 정리는 끝났지만 파이프가 열려 있다. 제한 시간만 기다린다.
+      pipeTimer ??= later(PIPE_DRAIN_MS, () => {
+        worsen('unverifiable');
+        finish();
+      });
+    }
+
+    /** D: 하드 데드라인. 더 늦은 시각으로만 갱신한다. */
+    function armHardDeadline(ms: number): void {
+      if (settled) return;
+      const at = Date.now() + ms;
+      if (hardAt >= at) return;
+      hardAt = at;
+      if (hardTimer) {
+        clearTimeout(hardTimer);
+        timers.delete(hardTimer);
+      }
+      hardTimer = later(ms, () => {
+        worsen(groupAlive() ? 'failed' : 'unverifiable');
+        finish();
+      });
+    }
+
+    /** SIGTERM → (유예) → SIGKILL 로 그룹 전체를 종료하고 그룹이 비었는지 확인한다. 정확히 한 번 실행된다. */
+    async function runProcedure(): Promise<void> {
+      killGroup('SIGTERM');
+      if (win32) {
+        worsen('unverifiable'); // Windows 에는 프로세스 그룹 확인이 없다
+        await sleep(grace);
+        killGroup('SIGKILL');
+      } else if (await waitGroupGone(grace)) {
+        worsen('confirmed');
+      } else {
+        killGroup('SIGKILL');
+        worsen((await waitGroupGone(KILL_CONFIRM_MS)) ? 'confirmed' : 'failed');
+      }
+      procedure = 'done';
+      if (cleanup === 'failed' || cleanup === 'unverifiable') finish(); // C: 확인하지 못했다면 더 기다리지 않고 그대로 보고한다
+      else evaluate();
+    }
+
+    /** 종료 요청 (timeout, abort, output_limit). 원인은 첫 요청만 기록하고 정리 절차는 한 번만 시작한다. */
+    function requestStop(reason: ProcessStatus): void {
+      if (settled) return;
+      cause ??= reason;
+      if (procedure !== 'idle') return;
+      procedure = 'running';
+      armHardDeadline(grace + KILL_CONFIRM_MS + PIPE_DRAIN_MS + HARD_SLACK_MS);
+      void runProcedure();
     }
 
     /**
      * 종료 요청 없이 부모가 끝난 경우(정상 종료, 외부 SIGKILL 등)에도 같은 그룹에 남은 프로세스를 확인한다.
-     * 짧은 유예 안에 스스로 끝나면 정상으로 보고, 아니면 잔존으로 기록하고 같은 종료 절차를 수행한다.
-     * 그룹 정리가 끝나기 전에는 결과를 확정하지 않는다.
+     * 짧은 유예 안에 스스로 끝나면 정상이고, 아니면 잔존으로 기록하고 같은 정리 절차를 수행한다.
      */
-    async function inspectOrphans(): Promise<void> {
-      terminating = true; // 이후 타임아웃·취소가 종료 절차를 중복 시작하지 않게 한다
-      cleanupDone = false;
-      if (await waitGroupGone(ORPHAN_SETTLE_MS)) {
-        cleanupDone = true;
-        tryFinish();
+    async function inspectGroup(): Promise<void> {
+      const gone = await waitGroupGone(ORPHAN_SETTLE_MS);
+      inspecting = false;
+      if (!settled && !gone && procedure === 'idle') {
+        orphans = true; // 종료 요청 없이 끝났는데 그룹에 남아 있었다
+        procedure = 'running';
+        void runProcedure();
         return;
       }
-      orphans = true;
-      await terminateGroup();
+      evaluate();
     }
 
-    /** 원인을 기록하고 종료를 시작한다. */
-    function stop(reason: ProcessStatus): void {
-      cause ??= reason;
-      if (terminating) return;
-      terminating = true;
-      cleanupDone = false;
-      void terminateGroup();
+    function onParentExit(code: number | null, signal: NodeJS.Signals | null): void {
+      if (settled || parent !== null) return;
+      parent = { code, signal };
+      armHardDeadline(ORPHAN_SETTLE_MS + grace + KILL_CONFIRM_MS + PIPE_DRAIN_MS + HARD_SLACK_MS);
+      if (!win32 && procedure === 'idle') {
+        inspecting = true;
+        void inspectGroup();
+      } else {
+        evaluate();
+      }
     }
 
     const collect = (which: 'out' | 'err', chunks: Buffer[]) => (data: Buffer) => {
+      if (settled) return;
       const room = spec.maxOutputBytes - sizes[which];
       if (data.length > room) {
         if (room > 0) chunks.push(data.subarray(0, room));
         sizes[which] = spec.maxOutputBytes;
         truncated = true;
-        stop('output_limit');
+        requestStop('output_limit');
         return;
       }
       chunks.push(data);
@@ -251,18 +332,19 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
 
     child.on('error', (e: NodeJS.ErrnoException) => {
       // pid가 없으면 프로세스가 시작되지 못한 것이다 (ENOENT, EACCES 등)
-      if (child.pid === undefined) finish('spawn_failed', null, null, { code: e.code, message: e.message });
+      if (child.pid === undefined) finish('spawn_failed', { code: e.code, message: e.message });
     });
-    child.on('exit', () => {
-      // Windows에는 프로세스 그룹이 없어 확인할 수 없다 (GroupCleanup 문서 참고)
-      if (!terminating && process.platform !== 'win32') void inspectOrphans();
-    });
+    child.on('exit', onParentExit);
     child.on('close', (code, signal) => {
-      closed = { code, signal };
-      tryFinish();
+      if (settled) return;
+      pipesClosed = true;
+      onParentExit(code, signal); // exit 보다 먼저 오는 일은 없지만 순서에 의존하지 않는다
+      evaluate();
     });
 
-    timers.push(setTimeout(() => stop('timeout'), spec.timeoutMs));
+    spec.signal?.addEventListener('abort', onAbort, { once: true });
+    if (spec.signal?.aborted) requestStop('aborted'); // 리스너 등록 전에 취소된 경우에 대한 방어
+    later(spec.timeoutMs, () => requestStop('timeout'));
 
     // 자식이 stdin을 읽지 않고 끝나면 EPIPE가 날 수 있으나 결과 판단에는 영향이 없다.
     child.stdin?.on('error', () => undefined);
@@ -274,5 +356,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
 const ORPHAN_SETTLE_MS = 100;
 /** SIGKILL 이후 프로세스 그룹이 비는 것을 기다리는 최대 시간 */
 const KILL_CONFIRM_MS = 1000;
-/** 그룹 정리가 끝난 뒤 close 이벤트를 기다리는 최대 시간 */
-const CLOSE_WAIT_MS = 1000;
+/** 부모와 그룹 정리가 끝난 뒤 파이프가 닫히기를 기다리는 최대 시간 (넘으면 그룹 밖 프로세스가 붙들고 있다고 본다) */
+const PIPE_DRAIN_MS = 1000;
+/** 하드 데드라인 여유 */
+const HARD_SLACK_MS = 500;

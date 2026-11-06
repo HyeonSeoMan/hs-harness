@@ -28,26 +28,79 @@ export function failure(type: AgentErrorType, message: string): AgentResponse {
   return { ok: false, error: { type, message: redact(message) }, completedSteps: [] };
 }
 
-const SECRET_KEY = String.raw`[A-Za-z0-9_-]{0,40}(?:api[_-]?key|token|secret|passw(?:or)?d)[A-Za-z0-9_-]{0,40}`;
-/** `키 [=:] "값"` — 따옴표로 감싼 값. 템플릿·자리표시자(${…}, <…>, {…}, %…)는 비밀값이 아니다. */
-const QUOTED_PAIR = new RegExp(`(${SECRET_KEY})(["']?)(\\s*[=:]\\s*)(["'])(?![$<{%])([^\\s"']{6,200})\\4`, 'gi');
-/** `키 [=:] 값` — 따옴표 없는 값은 6자 이상이면서 숫자가 하나 이상 있어야 한다 (`token: handling` 같은 문장을 가리지 않기 위함). */
-const BARE_PAIR = new RegExp(`(${SECRET_KEY})(["']?)(\\s*[=:]\\s*)(?![$<{%"'])(?=[A-Za-z0-9._~+/=-]{0,200}\\d)[A-Za-z0-9._~+/=-]{6,200}`, 'gi');
+/** 비밀 키 이름의 핵심 단어. 앞쪽 접두(access_, client_ 등)는 값 위치를 찾는 데 필요 없으므로 매칭하지 않는다(성능). */
+const SECRET_WORD = String.raw`(?:api[_-]?key|token|secret|passw(?:or)?d)`;
+const BARE_VALUE = /[A-Za-z0-9._~+/=-]{6,200}/y;
+
+/**
+ * 비밀값 규칙: 알려진 비밀 키 이름(api_key, token, secret, password)에 `=` 또는 `:` 로 이어진 값.
+ * 정규식은 "키 이름 + 구분자"의 위치만 찾고, 값은 직접 파싱한다:
+ *  - 따옴표(" 또는 ', 이스케이프된 \" 포함)로 시작하면 같은 종류의 닫는 따옴표까지 전체가 값이다.
+ *    내부 공백, 반대쪽 따옴표, 이스케이프된 따옴표를 모두 포함한다. 닫히지 않으면 그 줄 끝까지.
+ *    4자 미만(빈 값 포함)이거나 자리표시자(${…}, <…>, {…}, %…)로 시작하면 비밀값으로 보지 않는다.
+ *  - 따옴표가 없으면 6자 이상이면서 숫자가 하나 이상 있는 토큰만 값이다 (`token: handling` 같은 문장을 가리지 않기 위함).
+ */
+function maskKeyValuePairs(text: string): string {
+  const keySep = new RegExp(`${SECRET_WORD}[A-Za-z0-9_-]{0,40}\\\\?["']?\\s*[=:]\\s*`, 'gi');
+  let result = '';
+  let last = 0;
+  for (let m = keySep.exec(text); m !== null; m = keySep.exec(text)) {
+    const valueStart = m.index + m[0].length;
+    const masked = maskValueAt(text, valueStart);
+    if (masked === null) continue;
+    result += text.slice(last, valueStart) + masked.replacement;
+    last = masked.end;
+    keySep.lastIndex = masked.end;
+  }
+  return result + text.slice(last);
+}
+
+function maskValueAt(text: string, start: number): { replacement: string; end: number } | null {
+  // JSON 문자열 안에 이스케이프된 형태(\"…\")도 같은 규칙으로 읽는다: 여는 따옴표 앞의 백슬래시는 따옴표의 일부로 본다.
+  const escapedOpen = text[start] === '\\' && (text[start + 1] === '"' || text[start + 1] === "'");
+  const quotePos = escapedOpen ? start + 1 : start;
+  const quote = text[quotePos];
+  if (quote === '"' || quote === "'") {
+    const closer = escapedOpen ? `\\${quote}` : quote;
+    const contentStart = quotePos + 1;
+    let i = contentStart;
+    let closed = false;
+    while (i < text.length) {
+      if (text[i] === '\n') break; // 닫히지 않은 따옴표는 그 줄 끝까지
+      if (!escapedOpen && text[i] === '\\') {
+        i += 2; // 이스케이프된 문자(따옴표 포함)는 닫는 따옴표가 아니다
+        continue;
+      }
+      if (text.startsWith(closer, i)) {
+        closed = true;
+        break;
+      }
+      i += 1;
+    }
+    i = Math.min(i, text.length);
+    const content = text.slice(contentStart, i);
+    if (content.length < 4 || /^[$<{%]/.test(content)) return null;
+    return { replacement: `${text.slice(start, contentStart)}***${closed ? closer : ''}`, end: closed ? i + closer.length : i };
+  }
+  BARE_VALUE.lastIndex = start;
+  const bare = BARE_VALUE.exec(text);
+  if (bare === null || !/\d/.test(bare[0])) return null;
+  return { replacement: '***', end: start + bare[0].length };
+}
 
 /**
  * 토큰·키로 보이는 값을 가린다. 줄바꿈과 길이는 그대로 둔다 (리뷰 피드백처럼 내용을 보존해야 하는 텍스트용).
- * 알려진 형태(sk-/ghp_/AKIA/Bearer/개인 키)와, 키 이름(api_key, token, secret, password)에 `=` 또는 `:` 로 이어진 값을 가린다.
- * 일반 코드·설명을 과도하게 가리지 않기 위해 이름이 같아도 값이 비밀처럼 보이지 않으면 그대로 둔다.
+ * 알려진 형태(sk-/ghp_/AKIA/Bearer/개인 키)와, 비밀 키 이름에 이어진 값(maskKeyValuePairs 의 규칙)을 가린다.
  */
 export function maskSecrets(text: string): string {
-  return text
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[private key removed]')
-    .replace(/\b(sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, '$1-***')
-    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, 'gh_***')
-    .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA***')
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 ***')
-    .replace(QUOTED_PAIR, '$1$2$3$4***$4')
-    .replace(BARE_PAIR, '$1$2$3***');
+  return maskKeyValuePairs(
+    text
+      .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[private key removed]')
+      .replace(/\b(sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, '$1-***')
+      .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, 'gh_***')
+      .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA***')
+      .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 ***'),
+  );
 }
 
 /** 로그·상태에 남기는 한 줄 메시지용: 비밀값을 가리고 공백을 정리하며 길이를 제한한다. */

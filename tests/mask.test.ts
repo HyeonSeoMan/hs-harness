@@ -101,3 +101,64 @@ describe('parseSingleJsonObject: 키 중복(디코딩 후 기준)', () => {
     bad(String.raw`{"😀":1,"😀":2}`);
   });
 });
+
+describe('maskSecrets: 따옴표로 감싼 값 전체를 파싱해 가린다 (내부 공백·반대 따옴표·이스케이프)', () => {
+  it.each([
+    ['Codex 재현 1: 내부 공백', 'password: "synthetic phrase 123456"', ['synthetic', 'phrase', '123456']],
+    ['Codex 재현 2: 반대쪽 따옴표 포함', `client_secret = "synthetic'Quoted123"`, ['synthetic', 'Quoted123']],
+    ['작은따옴표 값 안의 큰따옴표', `token: 'synth"quoted 987654'`, ['synth', 'quoted', '987654']],
+    ['이스케이프된 큰따옴표', String.raw`api_key = "abc\"def123456 tail"`, ['def123456', 'tail']],
+    ['이스케이프된 작은따옴표', String.raw`secret: 'it\'s a secret 1234'`, ['secret 1234', "it\\'s"]],
+    ['숫자 없는 암구호', 'password = "correct horse battery staple"', ['correct', 'horse', 'battery', 'staple']],
+    ['JSON 문자열 안에 이스케이프된 형태', String.raw`{\"api_key\": \"synth value 12345\"}`, ['synth value', '12345']],
+    ['키 이름에 따옴표', `{"client_secret": "a b c 123456"}`, ['a b c', '123456']],
+  ])('%s', (_name, input, leaked) => {
+    const out = maskSecrets(input);
+    for (const piece of leaked) expect(out, `leaked "${piece}" in: ${out}`).not.toContain(piece);
+    expect(out).toContain('***');
+  });
+
+  it('같은 줄의 여러 값과 앞뒤 문맥은 보존하고, 닫히지 않은 따옴표는 그 줄 끝까지만 가린다', () => {
+    const two = maskSecrets(`password: "a b 1234", token: 'c d 5678' ok`);
+    expect(two).not.toMatch(/a b 1234|c d 5678/);
+    expect(two).toContain(', ');
+    expect(two.endsWith(' ok')).toBe(true);
+
+    const open = maskSecrets('password: "never closed 123456\nnext line stays: fine');
+    expect(open).not.toContain('123456');
+    expect(open).toContain('next line stays: fine');
+  });
+
+  it('따옴표와 값의 구조(키 이름·따옴표·구분자)는 유지한다', () => {
+    expect(maskSecrets('password: "synthetic phrase 123456"')).toBe('password: "***"');
+    expect(maskSecrets(`client_secret = 'x y z 1234'`)).toBe(`client_secret = '***'`);
+  });
+
+  it.each([
+    'password: "${PASSWORD}"',
+    'token = "<your token here>"',
+    'secret: "{{ vault.secret }}"',
+    'password = ""',
+    'token = "x"',
+    'He said "hello world 123456" to me',
+    'the label "password" is shown above the field',
+    'if (password == "") return false;',
+    'Enter your password: ',
+  ])('자리표시자·빈 값·일반 문장은 가리지 않는다: %s', (text) => {
+    expect(maskSecrets(text)).toBe(text);
+  });
+});
+
+describe('maskSecrets: 외부 입력(최대 수 MB)에 대해 선형에 가깝게 동작한다', () => {
+  it.each([
+    ['키워드 반복', 'token'.repeat(1_000_000)],
+    ['접두 문자 반복', ('api_key' + '_'.repeat(50)).repeat(80_000)],
+    ['닫히지 않은 따옴표', `password: "${'x'.repeat(5_000_000)}`],
+    ['백슬래시 반복', `password: "${'\\'.repeat(5_000_000)}`],
+    ['짧은 쌍 반복', 'password: "ab cd 12", '.repeat(150_000)],
+  ])('%s', (_name, text) => {
+    const started = Date.now();
+    maskSecrets(text);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
