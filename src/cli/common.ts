@@ -28,59 +28,138 @@ export function failure(type: AgentErrorType, message: string): AgentResponse {
   return { ok: false, error: { type, message: redact(message) }, completedSteps: [] };
 }
 
+/**
+ * ── 비밀값 마스킹 ─────────────────────────────────────────────────────────────
+ * 비밀값은 여러 표현 계층을 거쳐 온다: Codex 출력(JSON) → 파싱된 feedback 문자열 → (그 문자열이 다시 JSON 문자열 리터럴·객체
+ * 텍스트일 수 있음) → 상태 저장 → 다음 요청. 마스킹 지점은 `maskSecrets` 하나이며, 입력을 두 부류로 나눠 다룬다.
+ *  1) 전체가 유효한 JSON 객체·배열·문자열인 텍스트: 파싱한 실제 문자열 값에 같은 규칙을 적용한다 (값 안의 문자열은 재귀로 처리하므로
+ *     JSON.stringify 를 여러 번 적용한 값도 풀린다). 가릴 것이 없으면 원문을 글자 그대로 돌려주고, 가렸다면 같은 층수의 JSON 으로 다시
+ *     인코딩한다. 일반 텍스트를 임의로 디코딩하지 않는다 — 전체가 JSON 일 때만 JSON 으로 취급한다.
+ *  2) 그 밖의 일반 텍스트(문장 속에 JSON 조각이 섞인 경우 포함): "비밀 키 이름 + 구분자" 뒤의 값을 직접 파싱한다.
+ *     값의 인코딩 층은 여는 따옴표 앞 백슬래시 개수로 판단한다: 0개=일반 텍스트, 1개(\")=JSON 한 겹, 그 이상=층수를 알 수 없음.
+ * 해석할 수 없는 경우는 언제나 가리는 쪽으로 실패한다(fail-closed).
+ */
+
 /** 비밀 키 이름의 핵심 단어. 앞쪽 접두(access_, client_ 등)는 값 위치를 찾는 데 필요 없으므로 매칭하지 않는다(성능). */
 const SECRET_WORD = String.raw`(?:api[_-]?key|token|secret|passw(?:or)?d)`;
-const BARE_VALUE = /[A-Za-z0-9._~+/=-]{6,200}/y;
-
+const SECRET_WORD_RE = new RegExp(SECRET_WORD, 'i');
+/** 키 이름 뒤의 닫는 따옴표는 인코딩 층에 따라 \", \\\" 처럼 백슬래시가 붙을 수 있다. */
+const KEY_SEP = new RegExp(`${SECRET_WORD}[A-Za-z0-9_-]{0,40}\\\\{0,8}["']?\\s*[=:]\\s*`, 'gi');
+const BARE_VALUE = /[A-Za-z0-9._~+/=-]{6,200}/y; // 첫 글자가 $ < { % " ' 인 값은 이 문자 집합에 없어 따옴표 없는 값으로 매칭되지 않는다
+/** JSON 문자열 리터럴 안에 JSON 이 다시 들어 있는 층수의 상한. 넘으면 풀지 않고 통째로 가린다. */
+const MAX_ENCODING_DEPTH = 8;
+/** JSON 구조(객체·배열) 중첩 깊이의 상한. 넘는 부분은 통째로 가린다. */
+const MAX_STRUCT_DEPTH = 200;
 /**
- * 비밀값 규칙: 알려진 비밀 키 이름(api_key, token, secret, password)에 `=` 또는 `:` 로 이어진 값.
- * 정규식은 "키 이름 + 구분자"의 위치만 찾고, 값은 직접 파싱한다:
- *  - 따옴표(" 또는 ', 이스케이프된 \" 포함)로 시작하면 같은 종류의 닫는 따옴표까지 전체가 값이다.
- *    내부 공백, 반대쪽 따옴표, 이스케이프된 따옴표를 모두 포함한다. 닫히지 않으면 그 줄 끝까지.
- *    4자 미만(빈 값 포함)이거나 자리표시자(${…}, <…>, {…}, %…)로 시작하면 비밀값으로 보지 않는다.
- *  - 따옴표가 없으면 6자 이상이면서 숫자가 하나 이상 있는 토큰만 값이다 (`token: handling` 같은 문장을 가리지 않기 위함).
+ * 값 "전체"가 자리표시자 형태일 때만 비밀이 아니다: ${VAR}, $VAR, {{ name }}, {name}, <name>, %VAR%, %(name)s.
+ * 앞부분만 자리표시자인 값(`${HOME}realsecret`)이나 `{` 로 시작하는 실제 값은 비밀로 본다.
  */
-function maskKeyValuePairs(text: string): string {
-  const keySep = new RegExp(`${SECRET_WORD}[A-Za-z0-9_-]{0,40}\\\\?["']?\\s*[=:]\\s*`, 'gi');
-  let result = '';
-  let last = 0;
-  for (let m = keySep.exec(text); m !== null; m = keySep.exec(text)) {
-    const valueStart = m.index + m[0].length;
-    const masked = maskValueAt(text, valueStart);
-    if (masked === null) continue;
-    result += text.slice(last, valueStart) + masked.replacement;
-    last = masked.end;
-    keySep.lastIndex = masked.end;
+const PLACEHOLDER = /^(?:\$\{[^}]*\}|\$[A-Za-z_]\w*|\{\{[^}]*\}\}|\{[A-Za-z_][\w.-]*\}|<[^<>]*>|%[A-Za-z_]\w*%|%\(\w+\)[sd])$/;
+
+const isSecretValue = (content: string) => content.length >= 4 && !PLACEHOLDER.test(content.trim());
+
+/** JSON 이스케이프 시퀀스 하나를 풀어 (문자, 다음 위치)를 돌려준다. 잘못된 시퀀스는 백슬래시 그대로 한 글자로 본다. */
+function decodeJsonChar(text: string, i: number): { ch: string; next: number } {
+  if (text[i] !== '\\') return { ch: text[i] ?? '', next: i + 1 };
+  const e = text[i + 1];
+  switch (e) {
+    case '"': case '\\': case '/': return { ch: e, next: i + 2 };
+    case 'n': return { ch: '\n', next: i + 2 };
+    case 't': return { ch: '\t', next: i + 2 };
+    case 'r': return { ch: '\r', next: i + 2 };
+    case 'b': return { ch: '\b', next: i + 2 };
+    case 'f': return { ch: '\f', next: i + 2 };
+    case 'u': {
+      const hex = text.slice(i + 2, i + 6);
+      if (/^[0-9a-fA-F]{4}$/.test(hex)) return { ch: String.fromCharCode(parseInt(hex, 16)), next: i + 6 };
+      return { ch: '\\', next: i + 1 };
+    }
+    default: return { ch: '\\', next: i + 1 };
   }
-  return result + text.slice(last);
 }
 
-function maskValueAt(text: string, start: number): { replacement: string; end: number } | null {
-  // JSON 문자열 안에 이스케이프된 형태(\"…\")도 같은 규칙으로 읽는다: 여는 따옴표 앞의 백슬래시는 따옴표의 일부로 본다.
-  const escapedOpen = text[start] === '\\' && (text[start + 1] === '"' || text[start + 1] === "'");
-  const quotePos = escapedOpen ? start + 1 : start;
-  const quote = text[quotePos];
-  if (quote === '"' || quote === "'") {
-    const closer = escapedOpen ? `\\${quote}` : quote;
-    const contentStart = quotePos + 1;
-    let i = contentStart;
-    let closed = false;
-    while (i < text.length) {
-      if (text[i] === '\n') break; // 닫히지 않은 따옴표는 그 줄 끝까지
-      if (!escapedOpen && text[i] === '\\') {
-        i += 2; // 이스케이프된 문자(따옴표 포함)는 닫는 따옴표가 아니다
-        continue;
-      }
-      if (text.startsWith(closer, i)) {
-        closed = true;
+type Masked = { replacement: string; end: number };
+
+/** 일반 텍스트의 따옴표 값(층 0): 같은 종류의 닫는 따옴표까지. `\` 뒤의 문자는 이스케이프된 문자다(`\\` 와 `\"` 포함). */
+function maskQuotedPlain(text: string, start: number, quote: string): Masked | null {
+  const contentStart = start + 1;
+  let i = contentStart;
+  let closed = false;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\n') break; // 닫히지 않은 따옴표는 그 줄 끝까지
+    if (ch === '\\') {
+      if (text[i + 1] === '\n') {
+        i += 1;
         break;
       }
-      i += 1;
+      i += 2; // 이스케이프된 문자는 닫는 따옴표가 아니다
+      continue;
     }
-    i = Math.min(i, text.length);
-    const content = text.slice(contentStart, i);
-    if (content.length < 4 || /^[$<{%]/.test(content)) return null;
-    return { replacement: `${text.slice(start, contentStart)}***${closed ? closer : ''}`, end: closed ? i + closer.length : i };
+    if (ch === quote) {
+      closed = true;
+      break;
+    }
+    i += 1;
+  }
+  i = Math.min(i, text.length);
+  const content = text.slice(contentStart, i);
+  if (!isSecretValue(content)) return null;
+  return { replacement: `${text.slice(start, contentStart)}***${closed ? quote : ''}`, end: closed ? i + 1 : i };
+}
+
+/**
+ * JSON 한 겹으로 인코딩된 따옴표 값(층 1, 여는 따옴표가 `\"`). 값은 "디코딩된 일반 텍스트"가 인코딩된 형태이므로
+ * 글자를 하나씩 디코딩하며 일반 텍스트 규칙을 적용한다: 디코딩된 `\` 는 다음 글자를 이스케이프하고, 이스케이프되지 않은
+ * 디코딩된 `"` 가 닫는 따옴표다. 예) 인코딩 `\\\"` = 디코딩 `\"` = 값 안의 이스케이프된 따옴표(닫는 따옴표 아님).
+ */
+function maskQuotedEncoded(text: string, start: number): Masked | null {
+  const contentStart = start + 2; // `\"`
+  let i = contentStart;
+  let plainEscaped = false;
+  let closeStart = -1;
+  let closeEnd = -1;
+  while (i < text.length) {
+    if (text[i] === '"') break; // 인코딩된 영역을 감싸는 이스케이프되지 않은 따옴표: 영역의 끝
+    const { ch, next } = decodeJsonChar(text, i);
+    if (ch === '\n') break;
+    if (plainEscaped) {
+      plainEscaped = false;
+    } else if (ch === '\\') {
+      plainEscaped = true;
+    } else if (ch === '"') {
+      closeStart = i;
+      closeEnd = next;
+      break;
+    }
+    i = next;
+  }
+  const closed = closeStart >= 0;
+  const content = text.slice(contentStart, closed ? closeStart : Math.min(i, text.length));
+  if (!isSecretValue(content)) return null;
+  return {
+    replacement: `${text.slice(start, contentStart)}***${closed ? text.slice(closeStart, closeEnd) : ''}`,
+    end: closed ? closeEnd : Math.min(i, text.length),
+  };
+}
+
+/** 인코딩 층을 알 수 없는 따옴표 값: 그 줄 끝까지 가린다. */
+function maskToLineEnd(text: string, contentStart: number, opener: string): Masked | null {
+  let end = text.indexOf('\n', contentStart);
+  if (end < 0) end = text.length;
+  if (!isSecretValue(text.slice(contentStart, end))) return null;
+  return { replacement: `${opener}***`, end };
+}
+
+function maskValueAt(text: string, start: number): Masked | null {
+  let p = start;
+  while (text[p] === '\\') p += 1;
+  const quote = text[p];
+  if (quote === '"' || quote === "'") {
+    const backslashes = p - start;
+    if (backslashes === 0) return maskQuotedPlain(text, start, quote);
+    if (backslashes === 1 && quote === '"') return maskQuotedEncoded(text, start);
+    return maskToLineEnd(text, p + 1, text.slice(start, p + 1)); // 두 겹 이상 또는 \' : 층수를 알 수 없다
   }
   BARE_VALUE.lastIndex = start;
   const bare = BARE_VALUE.exec(text);
@@ -88,11 +167,23 @@ function maskValueAt(text: string, start: number): { replacement: string; end: n
   return { replacement: '***', end: start + bare[0].length };
 }
 
-/**
- * 토큰·키로 보이는 값을 가린다. 줄바꿈과 길이는 그대로 둔다 (리뷰 피드백처럼 내용을 보존해야 하는 텍스트용).
- * 알려진 형태(sk-/ghp_/AKIA/Bearer/개인 키)와, 비밀 키 이름에 이어진 값(maskKeyValuePairs 의 규칙)을 가린다.
- */
-export function maskSecrets(text: string): string {
+/** 일반 텍스트 규칙: 비밀 키 이름 뒤 `=`/`:` 로 이어진 값을 가린다. */
+function maskKeyValuePairs(text: string): string {
+  KEY_SEP.lastIndex = 0;
+  let result = '';
+  let last = 0;
+  for (let m = KEY_SEP.exec(text); m !== null; m = KEY_SEP.exec(text)) {
+    const valueStart = m.index + m[0].length;
+    const masked = maskValueAt(text, valueStart);
+    if (masked === null) continue;
+    result += text.slice(last, valueStart) + masked.replacement;
+    last = masked.end;
+    KEY_SEP.lastIndex = masked.end;
+  }
+  return result + text.slice(last);
+}
+
+function maskPlain(text: string): string {
   return maskKeyValuePairs(
     text
       .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[private key removed]')
@@ -101,6 +192,68 @@ export function maskSecrets(text: string): string {
       .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA***')
       .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 ***'),
   );
+}
+
+/** 전체가 유효한 JSON 객체·배열·문자열이면 파싱 결과를, 아니면 null. (숫자·불리언·null 만인 텍스트는 일반 텍스트로 본다.) */
+function parseStructuredJson(text: string): { value: unknown } | null {
+  const t = text.trim();
+  const first = t[0];
+  if (first !== '{' && first !== '[' && first !== '"') return null; // 빠른 거절: 대부분의 일반 텍스트는 여기서 끝난다
+  try {
+    const value: unknown = JSON.parse(t);
+    return typeof value === 'string' || (typeof value === 'object' && value !== null) ? { value } : null;
+  } catch {
+    return null;
+  }
+}
+
+const TOO_DEEP = '[redacted: nested encoding too deep]';
+
+/** 파싱된 JSON 값을 마스킹한다. secretKey: 이 값이 비밀 키 이름 아래에 있는지(배열 원소로 전파된다). */
+function maskJsonValue(value: unknown, secretKey: boolean, encodingDepth: number, structDepth: number, state: { changed: boolean }): unknown {
+  if (typeof value === 'string') {
+    if (secretKey && isSecretValue(value)) {
+      state.changed = true;
+      return '***';
+    }
+    const masked = maskLayered(value, encodingDepth);
+    if (masked !== value) state.changed = true;
+    return masked;
+  }
+  if (typeof value === 'number') {
+    if (secretKey && String(value).replace(/\D/g, '').length >= 6) {
+      state.changed = true;
+      return '***';
+    }
+    return value;
+  }
+  if (typeof value !== 'object' || value === null) return value;
+  if (structDepth >= MAX_STRUCT_DEPTH) {
+    state.changed = true;
+    return TOO_DEEP;
+  }
+  if (Array.isArray(value)) return value.map((v) => maskJsonValue(v, secretKey, encodingDepth, structDepth + 1, state));
+  return Object.fromEntries(
+    Object.entries(value).map(([k, v]) => [k, maskJsonValue(v, SECRET_WORD_RE.test(k), encodingDepth, structDepth + 1, state)]),
+  );
+}
+
+function maskLayered(text: string, encodingDepth: number): string {
+  const structured = parseStructuredJson(text);
+  if (structured === null) return maskPlain(text);
+  if (encodingDepth >= MAX_ENCODING_DEPTH) return TOO_DEEP; // 더 풀지 않고 통째로 가린다
+  const state = { changed: false };
+  const masked = maskJsonValue(structured.value, false, encodingDepth + 1, 0, state);
+  if (!state.changed) return text; // 가릴 것이 없으면 공백·들여쓰기까지 원문 그대로
+  return JSON.stringify(masked, null, text.includes('\n') ? 2 : undefined);
+}
+
+/**
+ * 토큰·키로 보이는 값을 가린다. 줄바꿈과 길이는 그대로 둔다 (리뷰 피드백처럼 내용을 보존해야 하는 텍스트용).
+ * 알려진 형태(sk-/ghp_/AKIA/Bearer/개인 키)와 비밀 키 이름에 이어진 값을 가리며, 표현 계층 규칙은 위 문서를 따른다.
+ */
+export function maskSecrets(text: string): string {
+  return maskLayered(text, 0);
 }
 
 /** 로그·상태에 남기는 한 줄 메시지용: 비밀값을 가리고 공백을 정리하며 길이를 제한한다. */

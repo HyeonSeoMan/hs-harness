@@ -345,4 +345,26 @@ describe('CodexAgent', () => {
       }
     });
   });
+
+  describe('2-b. 표현 계층이 다른 비밀값 (승인·반려 모두)', () => {
+    const TAIL = 'SYNTHETIC_TAIL_123456';
+    const plain = String.raw`api_key = "prefix\"${TAIL}"`;
+    const variants: Array<[string, string]> = [
+      ['일반 텍스트', `Please remove ${plain} now.`],
+      ['feedback 전체가 JSON 문자열 리터럴 (Codex 재현)', JSON.stringify(plain)],
+      ['feedback 이 JSON.stringify 2회', JSON.stringify(JSON.stringify(plain))],
+      ['feedback 이 JSON 객체 텍스트', JSON.stringify({ finding: plain, password: 'phrase with spaces' })],
+    ];
+
+    it.each(variants)('%s', async (_name, feedback) => {
+      for (const verdict of ['approved', 'changes_requested'] as const) {
+        const res = await agent(new FakeRunner([writes(JSON.stringify({ verdict, feedback }))])).run(reviewReq());
+        expect(res, verdict).toMatchObject({ ok: true, review: { verdict } });
+        const out = JSON.stringify(res);
+        expect(out, verdict).not.toContain(TAIL);
+        expect(out, verdict).not.toContain('prefix');
+        expect(out, verdict).not.toContain('phrase with spaces');
+      }
+    });
+  });
 });

@@ -421,6 +421,47 @@ describe('Codex 3차 리뷰 결함 수정 후의 오케스트레이터 수준 �
   });
 });
 
+describe('표현 계층별 비밀값이 워크플로 전체(반환·디스크·복원·다음 요청)에서 제거된다', () => {
+  const TAIL = 'SYNTHETIC_TAIL_123456';
+  const plain = String.raw`api_key = "prefix\"${TAIL}"`;
+  const layers: Array<[string, string]> = [
+    ['일반 텍스트', `Remove ${plain} from the config.`],
+    ['JSON.stringify 1회 (Codex 재현)', JSON.stringify(plain)],
+    ['JSON.stringify 2회', JSON.stringify(JSON.stringify(plain))],
+  ];
+
+  it.each(layers)('%s — 반려 후 수정 요청과 승인 모두', async (_name, feedback) => {
+    for (const verdict of ['changes_requested', 'approved'] as const) {
+      let n = 0;
+      const codex: Agent = {
+        id: 'codex',
+        run: (req, opts) =>
+          new CodexAgent(fake(n++ === 0 ? codexVerdict(verdict, feedback) : codexVerdict('approved', 'ok'))).run(req, opts),
+      };
+      const claude = new MockAgent('claude');
+      const { orch, store } = await orchestrateWithStore(claude, codex);
+      await orch.createTask({ id: 't1', description: 'x' });
+      const returned = await orch.run('t1');
+      expect(returned.status, verdict).toBe('COMPLETED');
+
+      const onDisk = await store.load(); // 디스크 상태
+      const restored = await Orchestrator.open({ store, agents: { claude, codex }, verifier: new MockVerifier() }); // 복원된 상태
+      const surfaces: Record<string, unknown> = {
+        반환값: returned,
+        디스크: onDisk,
+        복원: restored.getTask('t1'),
+        '다음 구현 요청': claude.calls,
+      };
+      for (const [where, value] of Object.entries(surfaces)) {
+        const text = JSON.stringify(value);
+        expect(text, `${verdict}/${where}`).not.toContain(TAIL);
+        expect(text, `${verdict}/${where}`).not.toContain('prefix');
+      }
+      if (verdict === 'changes_requested') expect(claude.calls[1]?.feedback, '다음 구현 요청에는 마스킹된 피드백이 전달된다').toContain('***');
+    }
+  });
+});
+
 describe('기존 Mock Agent와의 호환성', () => {
   it('확장된 Agent.run(request, options) 시그니처를 Mock도 그대로 만족한다', async () => {
     const mock: Agent = new MockAgent('claude');
