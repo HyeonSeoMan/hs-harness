@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Agent, AgentRunOptions } from '../agent.ts';
 import type { AgentId, AgentRequest, AgentResponse, ReviewVerdict } from '../types.ts';
 import {
@@ -8,9 +8,12 @@ import {
   DEFAULT_TIMEOUT_MS,
   PROBE_MAX_OUTPUT_BYTES,
   PROBE_TIMEOUT_MS,
-  extractJsonObject,
+  cancelled,
   failure,
+  hasDuplicateKey,
+  maskSecrets,
   parseJsonObject,
+  parseSingleJsonObject,
   processFailure,
   redact,
   type CliAgentOptions,
@@ -49,6 +52,8 @@ export class CodexAgent implements Agent {
   constructor(options: CodexOptions) {
     this.o = {
       ...options,
+      // 프로세스 cwd와 -C에 같은 값을 쓰고 상대 경로가 두 번 해석되지 않도록 절대 경로로 고정한다.
+      cwd: resolve(options.cwd),
       command: options.command ?? 'codex',
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxOutputBytes: options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
@@ -111,6 +116,7 @@ export class CodexAgent implements Agent {
   private async diagnose(res: ProcessResult, signal?: AbortSignal): Promise<AgentResponse> {
     const detail = failureDetail(res);
     const probe = await this.exec(['login', 'status'], undefined, PROBE_TIMEOUT_MS, PROBE_MAX_OUTPUT_BYTES, signal);
+    if (probe.status === 'aborted' || signal?.aborted) return cancelled('codex'); // 취소를 일반 실행 실패로 바꾸지 않는다
     if (probe.status === 'exited' && probe.exitCode === 1) {
       return failure('AUTH', `codex is not logged in (codex login status): ${detail}`);
     }
@@ -132,16 +138,21 @@ export class CodexAgent implements Agent {
   }
 }
 
-/** 리뷰 결과를 엄격하게 검증한다. 문제가 있으면 사유 문자열, 없으면 결과. 애매한 verdict를 승인으로 보지 않는다. */
+/**
+ * 리뷰 결과를 엄격하게 검증한다. 문제가 있으면 사유 문자열, 없으면 결과. 애매한 verdict를 승인으로 보지 않는다.
+ * 최종 답변 전체가 단일 JSON 객체일 때만 인정한다 (코드블록 추출·여러 객체·설명 혼합·중복 키는 모두 거부).
+ */
 function parseReview(text: string): { verdict: ReviewVerdict; feedback: string } | string {
-  const obj = extractJsonObject(text);
-  if (obj === null) return 'last message is not a JSON object';
+  const obj = parseSingleJsonObject(text);
+  if (obj === null) return 'last message is not exactly one JSON object';
+  if (hasDuplicateKey(text, 'verdict') || hasDuplicateKey(text, 'feedback')) return 'duplicate keys make the review ambiguous';
   const verdict = obj['verdict'];
   if (verdict !== 'approved' && verdict !== 'changes_requested') return 'verdict must be "approved" or "changes_requested"';
   const feedback = obj['feedback'];
   if (typeof feedback !== 'string') return 'feedback must be a string';
   if (verdict === 'changes_requested' && feedback.trim() === '') return 'changes_requested requires non-empty feedback';
-  return { verdict, feedback };
+  // 정상 리뷰의 피드백은 상태에 저장되고 다음 구현 요청으로 전달되므로 여기서 비밀값을 가린다.
+  return { verdict, feedback: maskSecrets(feedback) };
 }
 
 /** --json 이벤트에서 마지막 turn.failed 메시지를, 없으면 stderr를 사람이 읽을 사유로 쓴다 (분류에는 쓰지 않는다). */

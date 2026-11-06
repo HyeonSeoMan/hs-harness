@@ -1,5 +1,8 @@
+import { existsSync } from 'node:fs';
+import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { describe, expect, it } from 'vitest';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runProcess, type ProcessSpec } from '../src/cli/process.ts';
 
 const node = (code: string, over: Partial<ProcessSpec> = {}) =>
@@ -124,5 +127,91 @@ describe('프로세스 실행기', () => {
     const r = await node(`const b='y'.repeat(65536); setInterval(()=>process.stderr.write(b),1)`, { maxOutputBytes: 1000 });
     expect(r.status).toBe('output_limit');
     expect(Buffer.byteLength(r.stderr)).toBeLessThanOrEqual(1000);
+  });
+
+  describe('1. 부모가 종료돼도 하위 프로세스 정리가 끝난 뒤에 반환한다', () => {
+    const leaked: number[] = [];
+    afterEach(() => {
+      for (const pid of leaked.splice(0)) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // 이미 종료됨
+        }
+      }
+      vi.restoreAllMocks();
+    });
+
+    /** 부모는 SIGTERM에 바로 종료하고, 하위 프로세스는 SIGTERM을 무시한다 (stdio를 물려받지 않음). */
+    const PARENT = `
+      const c = require('child_process').spawn(process.execPath,
+        ['-e', "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { stdio: 'ignore' });
+      console.log(c.pid);
+      setInterval(() => {}, 1000);`;
+
+    it('타임아웃: 부모가 먼저 죽고 하위가 SIGTERM을 무시해도 반환 시점에 하위 프로세스가 남아 있지 않다', async () => {
+      const r = await node(PARENT, { timeoutMs: 800, killGraceMs: 150 });
+      const pid = Number(r.stdout.trim());
+      leaked.push(pid);
+      expect(r.status).toBe('timeout');
+      expect(alive(pid)).toBe(false); // 폴링 없이 즉시 확인: 정리가 끝나기 전에 반환하지 않는다
+      expect(r.cleanup).toBe('confirmed');
+    });
+
+    it('외부 취소와 출력 초과에서도 동일하다', async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 800);
+      const aborted = await node(PARENT, { signal: ac.signal, timeoutMs: 10_000, killGraceMs: 150 });
+      leaked.push(Number(aborted.stdout.trim()));
+      expect(aborted.status).toBe('aborted');
+      expect(alive(Number(aborted.stdout.trim()))).toBe(false);
+      expect(aborted.cleanup).toBe('confirmed');
+
+      const flood = await node(`${PARENT}; setInterval(()=>process.stdout.write('x'.repeat(65536)),1)`, { maxOutputBytes: 5000, timeoutMs: 10_000, killGraceMs: 150 });
+      const pid = Number(flood.stdout.split('\n')[0]);
+      leaked.push(pid);
+      expect(flood.status).toBe('output_limit');
+      expect(alive(pid)).toBe(false);
+      expect(flood.cleanup).toBe('confirmed');
+    });
+
+    it('정상 종료에서는 정리 작업이 필요하지 않다', async () => {
+      expect((await node(`console.log(1)`)).cleanup).toBe('not_needed');
+    });
+
+    it('종료를 확인할 수 없으면 정리 성공을 주장하지 않고 failed로 보고한다', async () => {
+      // 프로세스 그룹이 계속 살아 있는 것처럼 보이게 하고(신호 0 확인만 가로챔) 실제 종료 신호는 그대로 전달한다.
+      const real = process.kill.bind(process);
+      vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) =>
+        pid < 0 && sig === 0 ? true : real(pid, sig as NodeJS.Signals)) as typeof process.kill);
+      const r = await node(`setInterval(()=>{},1000)`, { timeoutMs: 200, killGraceMs: 100 });
+      expect(r.status).toBe('timeout');
+      expect(r.cleanup).toBe('failed');
+    });
+  });
+
+  describe('3. cwd 검사 중 발생한 취소를 놓치지 않는다', () => {
+    it('호출 직후 취소하면 프로세스를 시작하지 않는다', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'hs-abort-'));
+      const marker = join(dir, 'started');
+      const ac = new AbortController();
+      const pending = node(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`, { signal: ac.signal });
+      ac.abort(); // runProcess가 stat(cwd)를 기다리는 사이에 취소
+      const r = await pending;
+      await new Promise((res) => setTimeout(res, 300)); // 혹시 시작됐다면 마커를 쓸 시간을 준다
+      expect(r.status).toBe('aborted');
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it('여러 번 반복해도 취소가 유실되지 않는다', async () => {
+      for (let i = 0; i < 20; i++) {
+        const ac = new AbortController();
+        const pending = node(`setInterval(()=>{},1000)`, { signal: ac.signal, timeoutMs: 10_000 });
+        if (i % 2 === 0) ac.abort();
+        else await Promise.resolve().then(() => ac.abort());
+        const r = await pending;
+        expect(r.status).toBe('aborted');
+      }
+    });
   });
 });

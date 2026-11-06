@@ -1,4 +1,5 @@
 import { tmpdir } from 'node:os';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAgent } from '../src/cli/claude.ts';
 import { claudeResult, FakeRunner, proc, report, request } from './cli-helpers.ts';
@@ -14,8 +15,8 @@ describe('ClaudeCodeAgent', () => {
     expect(res).toEqual({ ok: true, completedSteps: ['scaffold', 'wire-up'], output: 'built it', checkpointNote: 'built it' });
   });
 
-  it('코드 블록으로 감싼 JSON과 structured_output 필드도 받아들인다', async () => {
-    const fenced = new FakeRunner([() => proc({ stdout: claudeResult({ result: `Done.\n\`\`\`json\n${report(['scaffold'])}\n\`\`\`` }) })]);
+  it('답변 전체가 코드 블록 하나인 JSON과 structured_output 필드도 받아들인다', async () => {
+    const fenced = new FakeRunner([() => proc({ stdout: claudeResult({ result: `\`\`\`json\n${report(['scaffold'])}\n\`\`\`` }) })]);
     expect(await agent(fenced).run(request())).toMatchObject({ ok: true, completedSteps: ['scaffold'] });
     const structured = new FakeRunner([() => proc({ stdout: claudeResult({ result: 'x', structured_output: { completedSteps: ['wire-up'], summary: 's' } }) })]);
     expect(await agent(structured).run(request())).toMatchObject({ ok: true, completedSteps: ['wire-up'] });
@@ -144,5 +145,58 @@ describe('ClaudeCodeAgent', () => {
       const text = JSON.stringify(res);
       expect(text).not.toMatch(/abcdefghijklmnop|ABCDEFGHIJ1234|hunter2/);
     });
+  });
+
+  describe('모호한 리포트는 성공으로 처리하지 않는다 (코드블록 추출 완화 제거)', () => {
+    const A = report(['scaffold', 'wire-up'], 'example');
+    const B = report(['scaffold'], 'real');
+    it.each([
+      ['예제 코드블록 + 설명 속 실제 결론', `Format example:\n\`\`\`json\n${A}\n\`\`\`\nI only finished scaffold.`],
+      ['코드블록 두 개', `\`\`\`json\n${A}\n\`\`\`\n\`\`\`json\n${B}\n\`\`\``],
+      ['JSON 두 개', `${A}\n${B}`],
+      ['JSON 뒤에 설명', `${B}\nDone!`],
+      ['같은 키가 두 번', '{"completedSteps":["scaffold"],"completedSteps":["scaffold","wire-up"],"summary":"x"}'],
+    ])('%s → EXECUTION 오류', async (_name, result) => {
+      const res = await agent(new FakeRunner([() => proc({ stdout: claudeResult({ result }) })])).run(request());
+      expect(res).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+    });
+
+    it('답변 전체가 코드블록 하나뿐인 경우(모델이 흔히 쓰는 형태)는 허용한다', async () => {
+      const res = await agent(new FakeRunner([() => proc({ stdout: claudeResult({ result: `\`\`\`json\n${B}\n\`\`\`` }) })])).run(request());
+      expect(res).toMatchObject({ ok: true, completedSteps: ['scaffold'] });
+    });
+  });
+
+  describe('4. 인증 확인 중 취소를 보존한다', () => {
+    it('claude auth status 실행 중 취소되면 EXECUTION이 아니라 UNAVAILABLE', async () => {
+      const ac = new AbortController();
+      const runner = new FakeRunner([
+        () => proc({ exitCode: 1, stdout: claudeResult({ is_error: true, result: 'Not logged in' }) }),
+        () => {
+          ac.abort();
+          return proc({ status: 'aborted', exitCode: null });
+        },
+      ]);
+      const res = await agent(runner).run(request(), { signal: ac.signal });
+      expect(res).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+      expect(JSON.stringify(res)).toContain('cancelled');
+    });
+
+    it('JSON 없는 비정상 종료 경로에서도 취소를 보존한다', async () => {
+      const ac = new AbortController();
+      const runner = new FakeRunner([() => proc({ exitCode: 1 }), () => {
+        ac.abort();
+        return proc({ status: 'aborted', exitCode: null });
+      }]);
+      expect(await agent(runner).run(request(), { signal: ac.signal })).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+    });
+  });
+
+  it('5. 상대 경로 cwd를 절대 경로로 정규화한다', async () => {
+    const rel = relative(process.cwd(), tmpdir());
+    const runner = new FakeRunner([() => proc({ stdout: claudeResult({ result: report([]) }) })]);
+    await agent(runner, { cwd: rel }).run(request());
+    expect(isAbsolute(runner.specs[0]!.cwd)).toBe(true);
+    expect(runner.specs[0]!.cwd).toBe(resolve(tmpdir()));
   });
 });

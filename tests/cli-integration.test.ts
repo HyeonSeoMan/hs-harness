@@ -1,15 +1,15 @@
 // 가짜 CLI(tests/fixtures/fake-cli.mjs)를 실제 프로세스로 실행해 어댑터 ↔ 오케스트레이터 연동을 검증한다.
 // 실제 claude/codex를 호출하지 않으므로 사용량을 쓰지 않는다.
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Agent } from '../src/agent.ts';
 import { ClaudeCodeAgent } from '../src/cli/claude.ts';
 import { CodexAgent } from '../src/cli/codex.ts';
 import { MockAgent, MockVerifier } from '../src/mock-agent.ts';
 import { Orchestrator } from '../src/orchestrator.ts';
-import { claudeResult, report, request } from './cli-helpers.ts';
+import { claudeResult, FakeRunner, proc, report, request } from './cli-helpers.ts';
 import { makeEnv } from './helpers.ts';
 
 const FAKE = new URL('./fixtures/fake-cli.mjs', import.meta.url).pathname;
@@ -24,8 +24,13 @@ const claudeOk = (steps: string[]) => ({ claudeStdout: claudeResult({ result: re
 const codexVerdict = (verdict: string, feedback = '') => ({ codexLastMessage: JSON.stringify({ verdict, feedback }) });
 
 async function orchestrate(claude: Agent, codex: Agent, extra = {}) {
+  return (await orchestrateWithStore(claude, codex, extra)).orch;
+}
+
+async function orchestrateWithStore(claude: Agent, codex: Agent, extra = {}) {
   const { store } = await makeEnv();
-  return Orchestrator.open({ store, agents: { claude, codex }, verifier: new MockVerifier(), ...extra });
+  const orch = await Orchestrator.open({ store, agents: { claude, codex }, verifier: new MockVerifier(), ...extra });
+  return { orch, store };
 }
 
 describe('실제 프로세스로 실행한 가짜 CLI 어댑터', () => {
@@ -142,6 +147,79 @@ describe('실제 프로세스로 실행한 가짜 CLI 어댑터', () => {
     const res = await new CodexAgent(fake({ hang: true })).run(request({ phase: 'review', remainingSteps: ['review'] }), { signal: ac.signal });
     expect(res).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
     expect(Date.now() - started).toBeLessThan(5000);
+  });
+});
+
+describe('Codex 리뷰 결함 수정 후의 오케스트레이터 수준 보장', () => {
+  const APPROVED_EXAMPLE = '{"verdict":"approved","feedback":""}';
+
+  it('2. 승인 예제 코드블록이 섞인 모호한 리뷰는 승인 기록도 완료 출처도 만들지 않는다', async () => {
+    const ambiguous = `Format example:\n\`\`\`json\n${APPROVED_EXAMPLE}\n\`\`\`\nConclusion: changes_requested, null is not handled.`;
+    const { orch, store } = await orchestrateWithStore(new MockAgent('claude'), new CodexAgent(fake({ codexLastMessage: ambiguous })), { maxAttempts: 3 });
+    await orch.createTask({ id: 't1', description: 'x' });
+    const t = await orch.run('t1');
+
+    expect(t.status).not.toBe('COMPLETED');
+    expect(t.status).toBe('FAILED');
+    expect(t.reviews).toHaveLength(0);
+    expect(t.completion).toBeNull();
+    expect(t.results.filter((r) => r.phase === 'review').every((r) => r.outcome === 'error')).toBe(true);
+    expect((await store.load()).tasks['t1']?.completion).toBeNull();
+  });
+
+  it('4. 시도 상한에 도달해도 인증 확인 중 취소는 FAILED(일반 실행 실패)가 아니라 PAUSED(UNAVAILABLE)다', async () => {
+    const ac = new AbortController();
+    const runner = new FakeRunner([
+      () => proc({ exitCode: 1, stdout: claudeResult({ is_error: true, result: 'boom' }) }),
+      () => {
+        ac.abort();
+        return proc({ status: 'aborted', exitCode: null });
+      },
+    ]);
+    const adapter = new ClaudeCodeAgent({ cwd: tmpdir(), runner });
+    const claude: Agent = { id: 'claude', run: (req) => adapter.run(req, { signal: ac.signal }) };
+    const orch = await orchestrate(claude, new MockAgent('codex'), { maxAttempts: 1 });
+    await orch.createTask({ id: 't1', description: 'x' });
+    const t = await orch.run('t1');
+
+    expect(t.status).toBe('PAUSED');
+    expect(t.pauseCause).toBe('AGENT_UNAVAILABLE');
+    expect(t.lastError?.type).toBe('UNAVAILABLE');
+    expect(orch.getAgentStatuses().claude).toBe('UNAVAILABLE');
+  });
+
+  it('5. 상대 경로 cwd로 실제 프로세스를 실행해도 -C와 프로세스 cwd가 같은 작업 루트다', async () => {
+    const log = join(await makeEnvDir(), 'rel.jsonl');
+    const rel = relative(process.cwd(), tmpdir());
+    expect(isAbsolute(rel)).toBe(false);
+    await new CodexAgent({ ...fake(codexVerdict('approved'), { FAKE_LOG: log }), cwd: rel }).run(request({ phase: 'review', remainingSteps: ['review'] }));
+    const call = JSON.parse((await readFile(log, 'utf8')).trim().split('\n')[0]!);
+    const c = call.args[call.args.indexOf('-C') + 1];
+    expect(isAbsolute(c)).toBe(true);
+    expect(await realpath(c)).toBe(await realpath(call.cwd));
+    expect(await realpath(c)).toBe(await realpath(tmpdir()));
+  });
+
+  it('6. 리뷰 피드백의 비밀값은 반환값·저장된 상태·다음 구현 요청 어디에도 원문이 남지 않는다', async () => {
+    const secret = 'sk-synthetic-0123456789abcdef';
+    let n = 0;
+    const codex: Agent = {
+      id: 'codex',
+      run: (req, opts) =>
+        new CodexAgent(
+          fake(n++ === 0 ? codexVerdict('changes_requested', `Remove hardcoded key ${secret} from config.`) : codexVerdict('approved')),
+        ).run(req, opts),
+    };
+    const claude = new MockAgent('claude');
+    const { orch, store } = await orchestrateWithStore(claude, codex);
+    await orch.createTask({ id: 't1', description: 'x' });
+    const t = await orch.run('t1');
+
+    expect(t.status).toBe('COMPLETED');
+    expect(claude.calls[1]?.feedback).toContain('Remove hardcoded key');
+    expect(JSON.stringify(claude.calls)).not.toContain(secret); // 다음 구현 요청
+    expect(JSON.stringify(t)).not.toContain(secret); // 반환값
+    expect(JSON.stringify(await store.load())).not.toContain(secret); // 저장된 상태
   });
 });
 

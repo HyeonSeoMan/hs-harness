@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import { CodexAgent } from '../src/cli/codex.ts';
@@ -23,7 +23,7 @@ describe('CodexAgent', () => {
   });
 
   it('변경 요청 리뷰와 피드백을 전달한다', async () => {
-    const runner = new FakeRunner([writes('```json\n{"verdict":"changes_requested","feedback":"handle null"}\n```')]);
+    const runner = new FakeRunner([writes('{"verdict":"changes_requested","feedback":"handle null"}')]);
     expect(await agent(runner).run(reviewReq())).toMatchObject({ ok: true, review: { verdict: 'changes_requested', feedback: 'handle null' } });
   });
 
@@ -136,6 +136,103 @@ describe('CodexAgent', () => {
         const res = await agent(new FakeRunner([() => proc(over)])).run(reviewReq());
         expect(res).toMatchObject({ ok: false, error: { type } });
       }
+    });
+  });
+
+  describe('2. 최종 리뷰는 전체가 단일 JSON 객체일 때만 인정한다', () => {
+    const APPROVED = '{"verdict":"approved","feedback":""}';
+    const CHANGES = '{"verdict":"changes_requested","feedback":"null is not handled"}';
+
+    it.each([
+      ['승인 예제 코드블록 + 실제 결론은 changes_requested (원 결함)', `The expected format is:\n\`\`\`json\n${APPROVED}\n\`\`\`\nMy conclusion: changes_requested because null is not handled.`],
+      ['승인 예제 코드블록만 있는 답변', `\`\`\`json\n${APPROVED}\n\`\`\``],
+      ['변경 요청 코드블록만 있는 답변도 코드블록 추출로 인정하지 않는다', `\`\`\`json\n${CHANGES}\n\`\`\``],
+      ['JSON 객체 두 개 (줄바꿈으로 연결)', `${CHANGES}\n${APPROVED}`],
+      ['JSON 객체 두 개 (붙어 있음)', `${APPROVED}${CHANGES}`],
+      ['JSON 뒤에 설명', `${CHANGES}\nThat is my verdict.`],
+      ['설명 뒤에 JSON', `Verdict follows.\n${APPROVED}`],
+      ['같은 키가 두 번 (verdict가 모호함)', '{"verdict":"changes_requested","feedback":"x","verdict":"approved"}'],
+    ])('%s → 오류이며 review가 없다', async (_name, message) => {
+      const res = await agent(new FakeRunner([writes(message)])).run(reviewReq());
+      expect(res).toMatchObject({ ok: false, error: { type: 'EXECUTION' } });
+      expect('review' in res).toBe(false);
+    });
+
+    it('feedback 문자열 안에 승인 JSON 예제가 들어 있어도 실제 verdict만 본다', async () => {
+      const message = JSON.stringify({ verdict: 'changes_requested', feedback: `Do not reply with {"verdict":"approved","feedback":""} yet.` });
+      expect(await agent(new FakeRunner([writes(message)])).run(reviewReq())).toMatchObject({
+        ok: true,
+        review: { verdict: 'changes_requested' },
+      });
+    });
+
+    it('앞뒤 공백·개행만 있는 단일 JSON은 인정한다', async () => {
+      expect(await agent(new FakeRunner([writes(`\n  ${CHANGES}\n`)])).run(reviewReq())).toMatchObject({ ok: true, review: { verdict: 'changes_requested' } });
+    });
+  });
+
+  describe('4. 인증 확인 중 취소를 보존한다', () => {
+    it('codex login status 실행 중 취소되면 EXECUTION이 아니라 UNAVAILABLE', async () => {
+      const ac = new AbortController();
+      const runner = new FakeRunner([
+        () => proc({ exitCode: 1, stdout: '{"type":"turn.failed","error":{"message":"boom"}}\n' }),
+        () => {
+          ac.abort();
+          return proc({ status: 'aborted', exitCode: null });
+        },
+      ]);
+      const res = await agent(runner).run(reviewReq(), { signal: ac.signal });
+      expect(res).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+      expect(JSON.stringify(res)).toContain('cancelled');
+    });
+
+    it('본 실행이 끝난 직후 이미 취소된 상태여도 UNAVAILABLE', async () => {
+      const ac = new AbortController();
+      const runner = new FakeRunner([() => proc({ exitCode: 1 }), () => proc({ exitCode: 0 })]);
+      const run = agent(runner).run(reviewReq(), { signal: ac.signal });
+      ac.abort();
+      expect(await run).toMatchObject({ ok: false, error: { type: 'UNAVAILABLE' } });
+    });
+  });
+
+  describe('5. 상대 경로 cwd는 절대 경로로 정규화해 한 번만 적용한다', () => {
+    it('프로세스 cwd와 -C가 모두 같은 절대 경로이고 상대/절대 지정이 같은 작업 루트를 가리킨다', async () => {
+      const rel = relative(process.cwd(), tmpdir());
+      expect(isAbsolute(rel)).toBe(false);
+      const make = (cwd: string) => {
+        const runner = new FakeRunner([writes('{"verdict":"approved","feedback":""}')]);
+        return { runner, run: () => agent(runner, { cwd }).run(reviewReq()) };
+      };
+      const relCase = make(rel);
+      const absCase = make(resolve(tmpdir()));
+      await relCase.run();
+      await absCase.run();
+
+      for (const { runner } of [relCase, absCase]) {
+        const spec = runner.specs[0]!;
+        const c = spec.args[spec.args.indexOf('-C') + 1]!;
+        expect(isAbsolute(spec.cwd)).toBe(true);
+        expect(isAbsolute(c)).toBe(true);
+        expect(c).toBe(spec.cwd);
+        expect(c).toBe(resolve(tmpdir()));
+      }
+    });
+  });
+
+  describe('6. 정상 리뷰의 feedback에서도 비밀값을 가린다', () => {
+    const SYNTH = 'sk-synthetic-0123456789abcdef';
+
+    it('API 키·Bearer·key=value 형태가 반환값에서 마스킹되고 줄바꿈·길이는 보존된다', async () => {
+      const long = 'detail '.repeat(200);
+      const feedback = `Remove the hardcoded key ${SYNTH}.\nAlso Authorization: Bearer synthetictoken0123456789 and api_key=synthvalue123.\n${long}END`;
+      const res = await agent(new FakeRunner([writes(JSON.stringify({ verdict: 'changes_requested', feedback }))])).run(reviewReq());
+      expect(res).toMatchObject({ ok: true, review: { verdict: 'changes_requested' } });
+      const out = JSON.stringify(res);
+      expect(out).not.toMatch(/sk-synthetic|synthetictoken|synthvalue/);
+      const fb = (res as { review: { feedback: string } }).review.feedback;
+      expect(fb).toContain('Remove the hardcoded key');
+      expect(fb).toContain('\n'); // 줄바꿈 보존
+      expect(fb.endsWith('END')).toBe(true); // 400자로 잘리지 않음
     });
   });
 });

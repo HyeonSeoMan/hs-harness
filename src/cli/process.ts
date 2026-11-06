@@ -23,6 +23,16 @@ export interface ProcessSpec {
 
 export type ProcessStatus = 'exited' | 'spawn_failed' | 'timeout' | 'aborted' | 'output_limit';
 
+/**
+ * 종료(타임아웃·취소·출력 초과) 후 하위 프로세스 정리 결과.
+ *  - not_needed: 종료를 요청하지 않았다 (정상 종료 등)
+ *  - confirmed: 프로세스 그룹에 남은 프로세스가 없음을 확인했다
+ *  - failed: SIGKILL 후에도 프로세스 그룹에 프로세스가 남아 있다
+ *  - unverifiable: 이 OS(Windows)에서는 프로세스 그룹을 확인할 수 없다 (직접 자식만 종료 시도)
+ * 한계: setsid/setpgid로 다른 프로세스 그룹이나 세션을 만든 하위 프로세스는 그룹 종료와 확인 대상이 아니다.
+ */
+export type GroupCleanup = 'not_needed' | 'confirmed' | 'failed' | 'unverifiable';
+
 export interface ProcessResult {
   status: ProcessStatus;
   exitCode: number | null;
@@ -31,6 +41,8 @@ export interface ProcessResult {
   stderr: string;
   /** 출력 상한에 걸려 잘렸는지 */
   truncated: boolean;
+  /** 하위 프로세스 정리 결과. confirmed가 아닌 종료는 정리 성공으로 간주하면 안 된다. */
+  cleanup: GroupCleanup;
   durationMs: number;
   /** spawn_failed일 때 원인 (ENOENT, EACCES, CWD_INVALID 등) */
   error?: { code: string | undefined; message: string };
@@ -52,6 +64,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     stdout: '',
     stderr: '',
     truncated: false,
+    cleanup: 'not_needed',
     durationMs: Date.now() - started,
     ...(error && { error }),
   });
@@ -63,6 +76,8 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     // 잘못된 cwd는 spawn에서 ENOENT로 나와 "실행 파일 없음"과 헷갈리므로 먼저 구분한다.
     return empty('spawn_failed', { code: 'CWD_INVALID', message: `cwd is not a usable directory: ${spec.cwd} (${(e as Error).message})` });
   }
+  // stat을 기다리는 동안 취소됐을 수 있다. 리스너는 이미 지난 이벤트를 받지 못하므로 상태를 다시 확인한다.
+  if (spec.signal?.aborted) return empty('aborted');
 
   const env: Record<string, string | undefined> = { ...process.env, ...spec.env };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
@@ -75,6 +90,9 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     let truncated = false;
     let settled = false;
     let terminating = false;
+    let cleanupDone = true; // 종료를 요청하면 그룹 정리가 끝날 때까지 false
+    let cleanup: GroupCleanup = 'not_needed';
+    let closed: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     const timers: NodeJS.Timeout[] = [];
 
     let child: ChildProcess;
@@ -96,6 +114,7 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
 
     const onAbort = () => stop('aborted');
     spec.signal?.addEventListener('abort', onAbort, { once: true });
+    if (spec.signal?.aborted) stop('aborted'); // 리스너 등록 전에 취소된 경우에 대한 방어
 
     const finish = (status: ProcessStatus, exitCode: number | null, signal: NodeJS.Signals | null, error?: ProcessResult['error']) => {
       if (settled) return;
@@ -111,9 +130,16 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
         stdout: Buffer.concat(out).toString('utf8'),
         stderr: Buffer.concat(err).toString('utf8'),
         truncated,
+        cleanup,
         durationMs: Date.now() - started,
         ...(error && { error }),
       });
+    };
+
+    /** 부모 종료(close)와 프로세스 그룹 정리가 모두 끝났을 때만 결과를 확정한다. */
+    const tryFinish = () => {
+      if (settled || closed === null || !cleanupDone) return;
+      finish(cause ?? 'exited', closed.code, closed.signal);
     };
 
     const kill = (sig: NodeJS.Signals) => {
@@ -129,18 +155,56 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
       }
     };
 
-    /** 원인을 기록하고 SIGTERM → (유예) → SIGKILL 순으로 종료한다. close 이벤트에서 결과가 확정된다. */
+    /** 프로세스 그룹에 살아 있는 프로세스가 있는지 (신호 0은 전달 없이 존재만 확인한다). */
+    const groupAlive = (): boolean => {
+      if (child.pid === undefined) return false;
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (e) {
+        return (e as NodeJS.ErrnoException).code === 'EPERM'; // 존재하지만 권한이 없음
+      }
+    };
+
+    const waitGroupGone = async (ms: number): Promise<boolean> => {
+      const end = Date.now() + ms;
+      for (;;) {
+        if (!groupAlive()) return true;
+        if (settled || Date.now() >= end) return false;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
+    /**
+     * SIGTERM → (유예) → SIGKILL 로 그룹 전체를 종료하고, 그룹이 비었는지 확인한다.
+     * 부모가 먼저 종료돼도 SIGKILL 예약과 확인은 취소되지 않는다.
+     */
+    async function terminateGroup(): Promise<void> {
+      const grace = spec.killGraceMs ?? 2000;
+      kill('SIGTERM');
+      if (process.platform === 'win32') {
+        cleanup = 'unverifiable';
+        await new Promise((r) => setTimeout(r, grace));
+        kill('SIGKILL');
+      } else if (await waitGroupGone(grace)) {
+        cleanup = 'confirmed';
+      } else {
+        kill('SIGKILL');
+        cleanup = (await waitGroupGone(KILL_CONFIRM_MS)) ? 'confirmed' : 'failed';
+      }
+      cleanupDone = true;
+      if (closed !== null) tryFinish();
+      else if (cleanup === 'confirmed') timers.push(setTimeout(() => finish(cause ?? 'exited', null, null), CLOSE_WAIT_MS));
+      else finish(cause ?? 'exited', null, null); // 정리를 확인하지 못했다: 파이프를 붙든 프로세스를 기다리지 않고 그대로 보고한다
+    }
+
+    /** 원인을 기록하고 종료를 시작한다. */
     function stop(reason: ProcessStatus): void {
       cause ??= reason;
       if (terminating) return;
       terminating = true;
-      kill('SIGTERM');
-      const grace = spec.killGraceMs ?? 2000;
-      timers.push(
-        setTimeout(() => kill('SIGKILL'), grace),
-        // close가 끝내 오지 않아도 호출자가 영원히 기다리지 않도록 마지막 안전장치를 둔다.
-        setTimeout(() => finish(cause ?? reason, null, null), grace + 1000),
-      );
+      cleanupDone = false;
+      void terminateGroup();
     }
 
     const collect = (which: 'out' | 'err', chunks: Buffer[]) => (data: Buffer) => {
@@ -162,7 +226,10 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
       // pid가 없으면 프로세스가 시작되지 못한 것이다 (ENOENT, EACCES 등)
       if (child.pid === undefined) finish('spawn_failed', null, null, { code: e.code, message: e.message });
     });
-    child.on('close', (code, signal) => finish(cause ?? 'exited', code, signal));
+    child.on('close', (code, signal) => {
+      closed = { code, signal };
+      tryFinish();
+    });
 
     timers.push(setTimeout(() => stop('timeout'), spec.timeoutMs));
 
@@ -171,3 +238,8 @@ export async function runProcess(spec: ProcessSpec): Promise<ProcessResult> {
     child.stdin?.end(spec.stdin ?? '');
   });
 }
+
+/** SIGKILL 이후 프로세스 그룹이 비는 것을 기다리는 최대 시간 */
+const KILL_CONFIRM_MS = 1000;
+/** 그룹 정리가 끝난 뒤 close 이벤트를 기다리는 최대 시간 */
+const CLOSE_WAIT_MS = 1000;
